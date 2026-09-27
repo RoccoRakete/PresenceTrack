@@ -58,7 +58,12 @@ jobs:
         run: pip install --upgrade platformio
 
       - name: Firmware und Dateisystem bauen
-        run: pio run -t buildfs
+        # "pio run -t buildfs" baut bei einem frischen Checkout nur das
+        # Dateisystem-Image, nicht die Firmware - beide Targets brauchen
+        # getrennte Aufrufe, um firmware.bin UND littlefs.bin zu erhalten.
+        run: |
+          pio run
+          pio run -t buildfs
 
       - name: firmware.bin hochladen
         uses: actions/upload-artifact@v4
