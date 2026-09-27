@@ -1,0 +1,164 @@
+name: Firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: FIRMWARE_VERSION aus include/firmware.h lesen
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(grep -oP '#define FIRMWARE_VERSION "\K[0-9.]+' include/firmware.h)
+          if [ -z "$version" ]; then
+            echo "Konnte FIRMWARE_VERSION nicht aus include/firmware.h lesen" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "FIRMWARE_VERSION=$version"
+
+      # Vertrag mit der Firmware (include/firmware.h, Kommentar bei FIRMWARE_VERSION):
+      # ein Tag-Build MUSS exakt v<FIRMWARE_VERSION> heissen. Das Geraet
+      # (firmware_update.cpp, compareVersions) vergleicht diese Version mit dem
+      # Manifest - weicht der Tag ab, bietet es ein Release entweder endlos
+      # erneut an oder nie.
+      - name: Tag gegen FIRMWARE_VERSION pruefen
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          expected="v${{ steps.version.outputs.version }}"
+          if [ "${{ github.ref_name }}" != "$expected" ]; then
+            echo "Tag ${{ github.ref_name }} passt nicht zu FIRMWARE_VERSION ${{ steps.version.outputs.version }} (erwartet $expected)" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: PlatformIO-Cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            platformio-${{ runner.os }}-
+
+      - name: PlatformIO installieren
+        run: pip install --upgrade platformio
+
+      - name: Firmware und Dateisystem bauen
+        run: pio run -t buildfs
+
+      - name: firmware.bin hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: .pio/build/d1_mini/firmware.bin
+          if-no-files-found: error
+
+      - name: littlefs.bin hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: littlefs
+          path: .pio/build/d1_mini/littlefs.bin
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: littlefs
+          path: dist
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Assets benennen, manifest.json erzeugen und validieren
+        id: assets
+        run: |
+          set -euo pipefail
+          version="${{ needs.build.outputs.version }}"
+          tag="${{ github.ref_name }}"
+          fw_name="presencetrack-${version}-firmware.bin"
+          fs_name="presencetrack-${version}-littlefs.bin"
+          mv "dist/firmware.bin" "dist/${fw_name}"
+          mv "dist/littlefs.bin" "dist/${fs_name}"
+
+          python3 .github/scripts/gen_manifest.py \
+            --version "$version" --tag "$tag" --board d1_mini \
+            --commit "$(git rev-parse HEAD)" \
+            --firmware "dist/${fw_name}" --firmware-name "$fw_name" \
+            --filesystem "dist/${fs_name}" --filesystem-name "$fs_name" \
+            --out "dist/manifest.json"
+
+          # Zweite, unabhaengige Pruefung: manifest.json so lesen, wie es
+          # spaeter aus dem Release kommt (Struktur + echte Assets).
+          python3 .github/scripts/check_manifest.py "dist/manifest.json" \
+            --firmware "dist/${fw_name}" --filesystem "dist/${fs_name}"
+
+          (cd dist && sha256sum "${fw_name}" "${fs_name}" manifest.json > checksums.txt)
+
+          echo "fw_name=${fw_name}" >> "$GITHUB_OUTPUT"
+          echo "fs_name=${fs_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Release-Notizen zusammenstellen
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          annotation="$(git tag -l --format='%(contents)' "$tag")"
+          if [ -z "$annotation" ]; then
+            annotation="PresenceTrack $tag."
+          fi
+          {
+            printf '%s\n' "$annotation"
+            echo ""
+            echo "---"
+            echo ""
+            echo "**Update auf dem Geraet:** Web-Oberflaeche -> Tab \"Firmware\" -> \"Update von GitHub\"."
+            echo ""
+            echo "**Dateien in diesem Release:**"
+            echo "- \`${{ steps.assets.outputs.fw_name }}\` - Firmware"
+            echo "- \`${{ steps.assets.outputs.fs_name }}\` - Dateisystem (Web-UI aus data/)"
+            echo "- \`manifest.json\` - Update-Manifest, das das Geraet abfragt"
+            echo "- \`checksums.txt\` - sha256 aller Assets"
+          } > release-notes.md
+
+      - name: Release veroeffentlichen
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" \
+            "dist/${{ steps.assets.outputs.fw_name }}" \
+            "dist/${{ steps.assets.outputs.fs_name }}" \
+            "dist/manifest.json" \
+            "dist/checksums.txt" \
+            --title "PresenceTrack ${{ github.ref_name }}" \
+            --notes-file release-notes.md \
+            --verify-tag

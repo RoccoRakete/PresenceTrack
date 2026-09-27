@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PresenceTrack</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>PresenceTrack</h1>
+  <span id="mqtt-conn-indicator" class="chip">MQTT: –</span>
+</header>
+<nav class="tabs">
+  <button data-tab="status" class="active">Status</button>
+  <button data-tab="ld2450">Radar</button>
+  <button data-tab="zones">Zones</button>
+  <button data-tab="light">Light</button>
+  <button data-tab="mqtt">MQTT</button>
+  <button data-tab="system">System</button>
+  <button data-tab="firmware">Firmware</button>
+</nav>
+<main>
+
+<section class="tab-panel active" id="tab-status">
+  <div class="grid wide">
+    <div class="card hero">
+      <div class="label">Presence</div>
+      <div class="value big" id="stat-presence">–</div>
+      <svg id="status-map" class="zone-map mini" viewBox="-6000 -300 12000 6600" preserveAspectRatio="xMidYMin meet" role="img" aria-label="Live target map"></svg>
+      <div class="row"><span><i class="target-dot target-0"></i>Target 1</span><span id="stat-target-0">–</span></div>
+      <div class="row"><span><i class="target-dot target-1"></i>Target 2</span><span id="stat-target-1">–</span></div>
+      <div class="row"><span><i class="target-dot target-2"></i>Target 3</span><span id="stat-target-2">–</span></div>
+    </div>
+    <div class="card" id="stat-zones-card">
+      <h2>Zones</h2>
+      <div id="stat-zone-list"></div>
+    </div>
+    <div class="card">
+      <h2>Event Log</h2>
+      <ul id="event-list" class="event-list"></ul>
+    </div>
+  </div>
+  <div class="grid">
+    <div class="card stat"><div class="label">Targets</div><div class="value" id="stat-target-count">–</div></div>
+    <div class="card stat"><div class="label">Illuminance</div><div class="value" id="stat-illuminance">–</div></div>
+    <div class="card stat"><div class="label">MQTT</div><div class="value" id="stat-mqtt-status">–</div></div>
+    <div class="card stat"><div class="label">LD2450 Simulation</div><div class="value" id="stat-sim-ld2450">–</div></div>
+    <div class="card stat"><div class="label">BH1750 Simulation</div><div class="value" id="stat-sim-bh1750">–</div></div>
+  </div>
+  <div class="card">
+    <h2>Device</h2>
+    <div class="actions">
+      <button id="btn-reboot" class="btn">Reboot</button>
+      <button id="btn-factory-reset" class="btn danger">Factory Reset</button>
+    </div>
+    <div id="device-msg" class="muted"></div>
+  </div>
+</section>
+
+<section class="tab-panel" id="tab-ld2450">
+  <div class="card">
+    <h2>LD2450 Radar <span id="ld-save-indicator" class="save-indicator"></span></h2>
+    <label class="row"><span>Sensor enabled</span><input type="checkbox" id="ld-enabled" class="switch"></label>
+    <label class="row"><span>Multi-target tracking</span><input type="checkbox" id="ld-multi-target" class="switch"></label>
+    <label class="row"><span>Max range (mm)</span><input type="number" id="ld-max-range-mm" min="1000" max="6000"></label>
+    <label class="row"><span>Occupancy timeout (s)</span><input type="number" id="ld-occupancy-timeout-s" min="0" max="3600"></label>
+    <label class="row"><span>Moving threshold (cm/s)</span><input type="number" id="ld-moving-threshold-cm-s" min="0" max="1000"></label>
+    <label class="row"><span>Simulation enabled</span><input type="checkbox" id="ld-sim-enabled" class="switch"></label>
+    <label class="row"><span>RX pin</span><select id="ld-rx-pin" class="pin-select"></select></label>
+    <p class="muted warn" id="ld-rx-pin-warn" hidden></p>
+    <label class="row"><span>TX pin</span><select id="ld-tx-pin" class="pin-select"></select></label>
+    <p class="muted warn" id="ld-tx-pin-warn" hidden></p>
+    <p class="muted">Presence stays active for the occupancy timeout after the last target was lost. A target counts as moving while its speed is at least the moving threshold (0 = always moving). No hardware driver yet: with simulation disabled the radar delivers no data. Pins take effect after a restart.</p>
+  </div>
+</section>
+
+<section class="tab-panel" id="tab-zones">
+  <div class="card">
+    <h2>Zones <span id="zones-save-indicator" class="save-indicator"></span></h2>
+    <svg id="zone-map" class="zone-map editable" viewBox="-6000 -300 12000 6600" preserveAspectRatio="xMidYMin meet" role="img" aria-label="Zone editor map"></svg>
+    <p class="muted">Sensor at the top, looking down. Drag a corner to resize a zone or object, drag its body to move it. Grid: 1 m.</p>
+  </div>
+  <div class="zone-toolbar">
+    <button type="button" id="btn-zone-add" class="btn" disabled>+ Add zone</button>
+    <span class="muted">A zone appears in Home Assistant only once it is enabled. Min. signal quality ignores targets with a weaker signal in that zone: a higher value means less sensitive, 0 turns the filter off.</span>
+  </div>
+  <div id="zone-list" class="grid zones"></div>
+  <h2 class="section-title">Objects <span id="objects-save-indicator" class="save-indicator"></span></h2>
+  <div class="zone-toolbar">
+    <button type="button" id="btn-object-add" class="btn" disabled>+ Add object</button>
+    <span class="muted">Furniture and doors for orientation only, not reported to Home Assistant. The arrow shows the facing direction.</span>
+  </div>
+  <div id="object-list" class="grid zones"></div>
+</section>
+
+<section class="tab-panel" id="tab-light">
+  <div class="card">
+    <h2>Illuminance (BH1750) <span id="bh-save-indicator" class="save-indicator"></span></h2>
+    <label class="row"><span>Sensor enabled</span><input type="checkbox" id="bh-enabled" class="switch"></label>
+    <label class="row"><span>I²C address</span>
+      <select id="bh-i2c-address"><option value="35">0x23</option><option value="92">0x5C</option></select></label>
+    <label class="row"><span>Measurement mode</span>
+      <select id="bh-mode">
+        <option value="0">High resolution (1 lx)</option>
+        <option value="1">High resolution 2 (0.5 lx)</option>
+        <option value="2">Low resolution (4 lx)</option>
+      </select></label>
+    <label class="row"><span>Measurement interval (ms)</span><input type="number" id="bh-interval-ms" min="1000" max="3600000" step="100"></label>
+    <label class="row"><span>Simulation enabled</span><input type="checkbox" id="bh-sim-enabled" class="switch"></label>
+    <label class="row"><span>SDA pin</span><select id="bh-sda-pin" class="pin-select"></select></label>
+    <p class="muted warn" id="bh-sda-pin-warn" hidden></p>
+    <label class="row"><span>SCL pin</span><select id="bh-scl-pin" class="pin-select"></select></label>
+    <p class="muted warn" id="bh-scl-pin-warn" hidden></p>
+    <p class="muted">No hardware driver yet: with simulation disabled the sensor delivers no data. Pins take effect after a restart.</p>
+  </div>
+</section>
+
+<section class="tab-panel" id="tab-mqtt">
+  <div class="card" id="mqtt-card">
+    <h2>MQTT / Home Assistant <span id="mqtt-save-indicator" class="save-indicator"></span></h2>
+    <label class="row"><span>MQTT enabled</span><input type="checkbox" id="mqtt-enabled" class="switch"></label>
+    <label class="row"><span>Broker</span><input type="text" id="mqtt-host" maxlength="63" placeholder="192.168.1.10"></label>
+    <label class="row"><span>Port</span><input type="number" id="mqtt-port" min="1" max="65535"></label>
+    <label class="row"><span>Username</span><input type="text" id="mqtt-user" maxlength="31" autocomplete="off"></label>
+    <label class="row"><span>Password</span><input type="password" id="mqtt-pass" maxlength="63" autocomplete="new-password"></label>
+    <label class="row"><span>Topic prefix</span><input type="text" id="mqtt-topic-prefix" maxlength="31"></label>
+    <label class="row"><span>Device name</span><input type="text" id="mqtt-device-name" maxlength="31"></label>
+    <label class="row"><span>MQTT keepalive (s)</span><input type="number" id="mqtt-keepalive" min="5" max="120"></label>
+    <p class="muted">How often the firmware sends the MQTT server a sign of life. Lower = connection losses are detected sooner, higher = more tolerant of short Wi-Fi dropouts.</p>
+    <label class="row"><span>MQTT connection timeout (s)</span><input type="number" id="mqtt-socket-timeout" min="1" max="30"></label>
+    <p class="muted">How long the firmware waits for a reply from the server before it considers the connection lost. Must be lower than the keepalive.</p>
+  </div>
+  <div class="card" id="ha-expose-card">
+    <h2>Home Assistant Entities <span id="ha-expose-save-indicator" class="save-indicator"></span></h2>
+    <label class="row"><span>Presence</span><input type="checkbox" id="ha-presence" class="switch"></label>
+    <label class="row"><span>Target count</span><input type="checkbox" id="ha-target-count" class="switch"></label>
+    <label class="row"><span>Illuminance</span><input type="checkbox" id="ha-illuminance" class="switch"></label>
+    <label class="row"><span>Motion</span><input type="checkbox" id="ha-motion" class="switch"></label>
+    <label class="row"><span>Zone motion</span><input type="checkbox" id="ha-zone-motion" class="switch"></label>
+    <p class="muted">Disabled entities are removed from Home Assistant. Zone occupancy entities follow the zone's own enabled switch. "Still" is occupancy on with motion off.</p>
+  </div>
+  <div class="card" id="wifi-power-card">
+    <h2>Wi-Fi Connection Stability <span id="wifi-save-indicator" class="save-indicator"></span></h2>
+    <label class="row"><span>Disable Wi-Fi power saving</span><input type="checkbox" id="wifi-no-sleep" class="switch"></label>
+    <p class="muted">Some Wi-Fi chips briefly power down to save energy, which delays replies and can cause "Connection lost" messages. Disabling power saving fixes this at the cost of a slightly higher power draw – negligible for a permanently powered device.</p>
+  </div>
+</section>
+
+<section class="tab-panel" id="tab-system">
+  <div class="grid wide">
+    <div class="card">
+      <h2>ESP8266</h2>
+      <div class="row"><span>Uptime</span><span id="sys-uptime">–</span></div>
+      <div class="row"><span>Free heap</span><span id="sys-free-heap">–</span></div>
+      <div class="row"><span>Lowest free heap since boot</span><span id="sys-min-free-heap">–</span></div>
+      <div class="row"><span>Heap fragmentation</span><span id="sys-heap-frag">–</span></div>
+      <div class="row"><span>Chip ID</span><span id="sys-chip-id">–</span></div>
+      <div class="row"><span>Flash size</span><span id="sys-flash-size">–</span></div>
+      <div class="row"><span>Sketch size</span><span id="sys-sketch-size">–</span></div>
+      <div class="row"><span>Free sketch space</span><span id="sys-free-sketch">–</span></div>
+      <div class="row"><span>Core version</span><span id="sys-core-version">–</span></div>
+      <div class="row"><span>SDK version</span><span id="sys-sdk-version">–</span></div>
+      <div class="row"><span>Last reset reason</span><span id="sys-reset-reason">–</span></div>
+      <p class="muted">Settings persist across firmware updates (pio run -t upload). Only a filesystem upload (uploadfs) or factory reset clears them.</p>
+    </div>
+    <div class="card">
+      <h2>Wi-Fi</h2>
+      <div class="row"><span>SSID</span><span id="sys-wifi-ssid">–</span></div>
+      <div class="row"><span>Signal (RSSI)</span><span id="sys-wifi-rssi">–</span></div>
+      <div class="row"><span>IP address</span><span id="sys-wifi-ip">–</span></div>
+      <div class="row"><span>MAC address</span><span id="sys-wifi-mac">–</span></div>
+    </div>
+    <div class="card">
+      <h2>MQTT</h2>
+      <div class="row"><span>Status</span><span id="sys-mqtt-status" class="chip">–</span></div>
+      <div class="row"><span>Broker host</span><span id="sys-mqtt-host">–</span></div>
+    </div>
+    <div class="card">
+      <h2>Sensor Telemetry</h2>
+      <div class="row"><span>LD2450 mode</span><span id="sys-ld-mode" class="chip">–</span></div>
+      <div class="row"><span>LD2450 targets</span><span id="sys-ld-targets">–</span></div>
+      <div class="row"><span>LD2450 last update</span><span id="sys-ld-age">–</span></div>
+      <div class="row"><span>BH1750 mode</span><span id="sys-bh-mode" class="chip">–</span></div>
+      <div class="row"><span>BH1750 illuminance</span><span id="sys-bh-lux">–</span></div>
+      <div class="row"><span>BH1750 last update</span><span id="sys-bh-age">–</span></div>
+    </div>
+    <div class="card">
+      <h2>Backup &amp; Restore <span id="backup-indicator" class="save-indicator"></span></h2>
+      <p class="muted">Download a backup before a filesystem update (uploadfs) - it replaces the whole filesystem and erases the saved settings otherwise.</p>
+      <div class="actions">
+        <a id="btn-backup-download" class="btn" href="/api/config/backup" download="presencetrack-backup.json">Download backup</a>
+        <button type="button" id="btn-backup-restore" class="btn">Restore from file…</button>
+        <input type="file" id="backup-file-input" accept="application/json" hidden>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="tab-panel" id="tab-firmware">
+  <div class="grid wide">
+    <div class="card">
+      <h2>Installierte Firmware</h2>
+      <div class="row"><span>Firmware-Version</span><span id="fw-version">–</span></div>
+      <div class="row"><span>Sketch-Größe</span><span id="fw-sketch-size">–</span></div>
+      <div class="row"><span>Freier Sketch-Platz</span><span id="fw-free-sketch">–</span></div>
+      <div class="row"><span>Max. Firmware-Größe (OTA)</span><span id="fw-max-firmware">–</span></div>
+      <div class="row"><span>Dateisystem-Partition</span><span id="fw-fs-size">–</span></div>
+      <p class="muted">Firmware bauen: <code>pio run</code> → <code>.pio/build/d1_mini/firmware.bin</code>.
+        Dateisystem-Image (Web-Oberfläche aus <code>data/</code>) bauen: <code>pio run -t buildfs</code> → <code>.pio/build/d1_mini/littlefs.bin</code>.</p>
+    </div>
+    <div class="card" id="gh-update-card">
+      <h2>Update von GitHub <span id="gh-indicator" class="save-indicator"></span></h2>
+      <p class="muted">Das Gerät holt das neueste Release von <code>github.com/RoccoRakete/PresenceTrack</code> selbst herunter
+        und schreibt es in den Flash – ohne PC und ohne Datei-Upload. Die Einstellungen bleiben erhalten.</p>
+      <div class="row"><span>Installiert</span><span id="gh-current">–</span></div>
+      <div class="row"><span>Verfügbar</span><span id="gh-available">–</span></div>
+      <div class="row"><span>Umfang</span>
+        <select id="gh-target">
+          <option value="both">Firmware + Web-Oberfläche</option>
+          <option value="firmware">Nur Firmware</option>
+        </select></div>
+      <progress id="gh-progress" class="ota-progress" max="1" value="0" hidden></progress>
+      <div id="gh-msg" class="muted"></div>
+      <div class="actions">
+        <button type="button" id="btn-gh-check" class="btn">Auf Update prüfen</button>
+        <button type="button" id="btn-gh-install" class="btn primary" disabled>Jetzt aktualisieren</button>
+        <button type="button" id="btn-gh-abort" class="btn danger" hidden>Abbrechen</button>
+      </div>
+    </div>
+    <div class="card" id="ota-card">
+      <h2>Update einspielen <span id="ota-indicator" class="save-indicator"></span></h2>
+      <p class="muted warn">Während des Updates und des anschließenden Neustarts ist das Gerät nicht erreichbar (ca. 1 Minute). Diese Seite geöffnet lassen.</p>
+      <div class="row"><span>Firmware (firmware.bin)</span><input type="file" id="ota-fw-file" accept=".bin"></div>
+      <div id="ota-fw-hint" class="muted"></div>
+      <div class="row"><span>Dateisystem-Image (littlefs.bin, optional)</span><input type="file" id="ota-fs-file" accept=".bin,.fs"></div>
+      <div id="ota-fs-hint" class="muted"></div>
+      <p class="muted">Nur Firmware: Einstellungen bleiben erhalten, die Web-Oberfläche bleibt aber auf dem alten Stand.
+        Dateisystem-Image: ersetzt die Web-Oberfläche (index.html, app.js, style.css) und löscht dabei die gespeicherten Einstellungen –
+        sie werden nach dem Neustart automatisch aus dem Backup wiederhergestellt. Beides zusammen = vollständiges Release-Update.</p>
+      <ol id="ota-steps" class="ota-steps"></ol>
+      <progress id="ota-progress" class="ota-progress" max="1" value="0" hidden></progress>
+      <div id="ota-msg" class="muted"></div>
+      <div class="actions">
+        <button type="button" id="btn-ota-start" class="btn primary">Update starten</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Backup wiederherstellen <span id="ota-restore-indicator" class="save-indicator"></span></h2>
+      <p class="muted">Vor jedem Update lädt der Browser automatisch ein Konfigurations-Backup herunter
+        (<code>presence-config-backup-&lt;Datum_Uhrzeit&gt;.json</code>, im Download-Ordner des Browsers).
+        Genau diese Datei lässt sich hier wieder einspielen (<code>/api/config/restore</code>) – sie ersetzt alle aktuellen Einstellungen.</p>
+      <div class="actions">
+        <button type="button" id="btn-ota-restore" class="btn">Backup-Datei wählen…</button>
+        <input type="file" id="ota-restore-input" accept="application/json,.json" hidden>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<template id="zone-card-template">
+  <div class="card zone-card shape-card">
+    <div class="zone-head">
+      <span class="zone-color-swatch"></span>
+      <input type="text" class="shape-name" maxlength="23" placeholder="Zone name">
+      <input type="checkbox" class="zone-enabled switch" title="Zone enabled">
+      <button type="button" class="btn icon shape-delete" title="Delete zone" aria-label="Delete zone">✕</button>
+    </div>
+    <div class="coord-grid">
+      <label><span>X1 (mm)</span><input type="number" class="shape-coord" data-key="x1" min="-6000" max="6000"></label>
+      <label><span>Y1 (mm)</span><input type="number" class="shape-coord" data-key="y1" min="0" max="6000"></label>
+      <label><span>X2 (mm)</span><input type="number" class="shape-coord" data-key="x2" min="-6000" max="6000"></label>
+      <label><span>Y2 (mm)</span><input type="number" class="shape-coord" data-key="y2" min="0" max="6000"></label>
+      <label><span>Min. signal quality</span><input type="number" class="zone-min-resolution" min="0" max="65535" title="Targets below this signal quality are ignored for this zone. Higher value = less sensitive, 0 = filter off."></label>
+    </div>
+  </div>
+</template>
+
+<template id="object-card-template">
+  <div class="card object-card shape-card">
+    <div class="zone-head">
+      <span class="zone-color-swatch"></span>
+      <input type="text" class="shape-name" maxlength="23" placeholder="Object name">
+      <button type="button" class="btn icon shape-delete" title="Delete object" aria-label="Delete object">✕</button>
+    </div>
+    <div class="coord-grid">
+      <label><span>Type</span>
+        <select class="object-type">
+          <option value="cabinet">Cabinet</option>
+          <option value="sofa">Sofa</option>
+          <option value="door">Door</option>
+          <option value="table">Table</option>
+          <option value="other">Other</option>
+        </select></label>
+      <label><span>Rotation</span>
+        <select class="object-rotation">
+          <option value="0">0°</option>
+          <option value="90">90°</option>
+          <option value="180">180°</option>
+          <option value="270">270°</option>
+        </select></label>
+      <label><span>X1 (mm)</span><input type="number" class="shape-coord" data-key="x1" min="-6000" max="6000"></label>
+      <label><span>Y1 (mm)</span><input type="number" class="shape-coord" data-key="y1" min="0" max="6000"></label>
+      <label><span>X2 (mm)</span><input type="number" class="shape-coord" data-key="x2" min="-6000" max="6000"></label>
+      <label><span>Y2 (mm)</span><input type="number" class="shape-coord" data-key="y2" min="0" max="6000"></label>
+    </div>
+  </div>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

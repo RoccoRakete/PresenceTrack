@@ -1,0 +1,9 @@
+.pio/
+.direnv/
+.config-backups/
+
+# von PlatformIO neu erzeugt, enthaelt absolute lokale Pfade
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+
+__pycache__/
