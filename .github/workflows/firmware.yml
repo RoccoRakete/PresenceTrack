@@ -133,10 +133,25 @@ jobs:
           echo "fs_name=${fs_name}" >> "$GITHUB_OUTPUT"
 
       - name: Release-Notizen zusammenstellen
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           tag="${{ github.ref_name }}"
-          annotation="$(git tag -l --format='%(contents)' "$tag")"
+          # Nicht "git tag -l --format=%(contents)" auf dem lokalen Checkout:
+          # actions/checkout legt den Tag beim Auschecken eines Tag-Refs als
+          # lokale Referenz direkt auf den Commit an, ohne das Tag-Objekt
+          # (samt Annotation) zu uebernehmen - "%(contents)" liefert dann
+          # unbemerkt die Commit-Message statt der Tag-Message. Stattdessen
+          # das Tag-Objekt ueber die API lesen, das ist unabhaengig vom
+          # lokalen Checkout-Zustand.
+          tag_sha="$(gh api "repos/${{ github.repository }}/git/refs/tags/$tag" --jq .object.sha)"
+          tag_type="$(gh api "repos/${{ github.repository }}/git/refs/tags/$tag" --jq .object.type)"
+          if [ "$tag_type" = "tag" ]; then
+            annotation="$(gh api "repos/${{ github.repository }}/git/tags/$tag_sha" --jq .message)"
+          else
+            annotation=""
+          fi
           if [ -z "$annotation" ]; then
             annotation="PresenceTrack $tag."
           fi
