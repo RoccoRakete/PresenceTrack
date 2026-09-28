@@ -696,7 +696,7 @@ async function resetWifiSetup() {
 // ---------- Sections + auto-save ----------
 // tab = data-tab the section is loaded for; the form root is `root` or #tab-<key>.
 // kind: map shape kind (zones/objects share the Zones tab, each with its own list as root).
-// mqtt/haExpose/wifi share the MQTT tab, each with its own card as root.
+// mqtt/haExpose share the MQTT tab, each with its own card as root. wifi lives on the System tab.
 const sections = {
   ld2450: { tab: 'ld2450', path: '/api/config/ld2450', ind: 'ld-save-indicator', render: renderLd, collect: collectLd,
     pins: { prefix: 'ld', keys: ['rx_pin', 'tx_pin'] } },
@@ -707,7 +707,7 @@ const sections = {
   mqtt: { tab: 'mqtt', root: '#mqtt-card', path: '/api/config/mqtt', ind: 'mqtt-save-indicator', render: renderMqtt, collect: collectMqtt },
   haExpose: { tab: 'mqtt', root: '#ha-expose-card', path: '/api/config/ha-expose', ind: 'ha-expose-save-indicator',
     render: renderHaExpose, collect: collectHaExpose },
-  wifi: { tab: 'mqtt', root: '#network-card', path: '/api/config/wifi', ind: 'wifi-save-indicator', render: renderWifi, collect: collectWifi,
+  wifi: { tab: 'system', root: '#network-card', path: '/api/config/wifi', ind: 'wifi-save-indicator', render: renderWifi, collect: collectWifi,
     restart: 'Reboot the device now to apply the new network settings? It may come back under a new IP address.' }
 };
 

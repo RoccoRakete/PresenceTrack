@@ -140,30 +140,30 @@
     <label class="row"><span>Zone motion</span><input type="checkbox" id="ha-zone-motion" class="switch"></label>
     <p class="muted">Disabled entities are removed from Home Assistant. Zone occupancy entities follow the zone's own enabled switch. "Still" is occupancy on with motion off.</p>
   </div>
-  <div class="card" id="network-card">
-    <h2>Network <span id="wifi-save-indicator" class="save-indicator"></span></h2>
-    <label class="row"><span>Disable Wi-Fi power saving</span><input type="checkbox" id="wifi-no-sleep" class="switch"></label>
-    <p class="muted">Some Wi-Fi chips briefly power down to save energy, which delays replies and can cause "Connection lost" messages. Disabling power saving fixes this at the cost of a slightly higher power draw – negligible for a permanently powered device.</p>
-    <label class="row"><span>Hostname</span><input type="text" id="wifi-hostname" maxlength="31" pattern="[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?" placeholder="presencetrack"></label>
-    <label class="row"><span>Static IP address</span><input type="checkbox" id="wifi-use-static-ip" class="switch"></label>
-    <div id="wifi-static-fields" hidden>
-      <label class="row"><span>IP address</span><input type="text" id="wifi-static-ip" maxlength="15" placeholder="192.168.1.50"></label>
-      <label class="row"><span>Gateway</span><input type="text" id="wifi-gateway" maxlength="15" placeholder="192.168.1.1"></label>
-      <label class="row"><span>Subnet mask</span><input type="text" id="wifi-subnet" maxlength="15" placeholder="255.255.255.0"></label>
-      <label class="row"><span>DNS server</span><input type="text" id="wifi-dns" maxlength="15" placeholder="same as gateway"></label>
-    </div>
-    <p class="muted warn" id="wifi-fallback-warn" hidden>The static IP did not work on the last boots (Wi-Fi or gateway unreachable), so the device is using DHCP. Correct the settings, or cycle the power to try the static IP again.</p>
-    <p class="muted">Hostname and IP settings take effect after a restart. If the static IP fails three boots in a row, the device falls back to DHCP.</p>
-    <div class="actions">
-      <button type="button" id="btn-wifi-reset" class="btn danger">Restart Wi-Fi setup</button>
-    </div>
-    <p class="muted">Forgets the Wi-Fi network and restarts. Connect to the Wi-Fi <code>PresenceTrack-Setup</code> afterwards to choose a network and enter its password.</p>
-    <div id="wifi-msg" class="muted"></div>
-  </div>
 </section>
 
 <section class="tab-panel" id="tab-system">
   <div class="grid wide">
+    <div class="card" id="network-card">
+      <h2>Network <span id="wifi-save-indicator" class="save-indicator"></span></h2>
+      <label class="row"><span>Disable Wi-Fi power saving</span><input type="checkbox" id="wifi-no-sleep" class="switch"></label>
+      <p class="muted">Some Wi-Fi chips briefly power down to save energy, which delays replies and can cause "Connection lost" messages. Disabling power saving fixes this at the cost of a slightly higher power draw – negligible for a permanently powered device.</p>
+      <label class="row"><span>Hostname</span><input type="text" id="wifi-hostname" maxlength="31" pattern="[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?" placeholder="presencetrack"></label>
+      <label class="row"><span>Static IP address</span><input type="checkbox" id="wifi-use-static-ip" class="switch"></label>
+      <div id="wifi-static-fields" hidden>
+        <label class="row"><span>IP address</span><input type="text" id="wifi-static-ip" maxlength="15" placeholder="192.168.1.50"></label>
+        <label class="row"><span>Gateway</span><input type="text" id="wifi-gateway" maxlength="15" placeholder="192.168.1.1"></label>
+        <label class="row"><span>Subnet mask</span><input type="text" id="wifi-subnet" maxlength="15" placeholder="255.255.255.0"></label>
+        <label class="row"><span>DNS server</span><input type="text" id="wifi-dns" maxlength="15" placeholder="same as gateway"></label>
+      </div>
+      <p class="muted warn" id="wifi-fallback-warn" hidden>The static IP did not work on the last boots (Wi-Fi or gateway unreachable), so the device is using DHCP. Correct the settings, or cycle the power to try the static IP again.</p>
+      <p class="muted">Hostname and IP settings take effect after a restart. If the static IP fails three boots in a row, the device falls back to DHCP.</p>
+      <div class="actions">
+        <button type="button" id="btn-wifi-reset" class="btn danger">Restart Wi-Fi setup</button>
+      </div>
+      <p class="muted">Forgets the Wi-Fi network and restarts. Connect to the Wi-Fi <code>PresenceTrack-Setup</code> afterwards to choose a network and enter its password.</p>
+      <div id="wifi-msg" class="muted"></div>
+    </div>
     <div class="card">
       <h2>ESP8266</h2>
       <div class="row"><span>Uptime</span><span id="sys-uptime">–</span></div>
