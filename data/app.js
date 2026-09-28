@@ -957,7 +957,6 @@ async function loadSystem() {
     setText('sys-sdk-version', orDash(s.sdk_version));
     setText('sys-reset-reason', orDash(s.reset_reason));
     setText('fw-version', orDash(s.fw_version));
-    setText('gh-current', orDash(s.fw_version));
     setText('fw-sketch-size', fmtBytes(s.sketch_size_bytes));
     setText('fw-free-sketch', fmtBytes(s.free_sketch_space_bytes));
     setText('fw-max-firmware', fmtBytes(s.ota_max_firmware_bytes));
@@ -978,7 +977,6 @@ function openTab(name) {
   if (name === 'status') loadEvents();
   if (name === 'system' && !systemLoaded) loadSystem();
   if (name === 'firmware' && !otaBusy) loadSystem(); // always fresh: sketch size/limits change with an update
-  if (name === 'firmware') ghResume();
   scaleMaps(); // maps in hidden tabs have no size until shown
   renderState(lastState); // show the last known values until the next poll arrives
 }
@@ -1102,9 +1100,8 @@ function setOtaProgress(fraction) {
 function lockOta(locked) {
   otaBusy = locked;
   ['#btn-ota-start', '#ota-fw-file', '#ota-fs-file', '#btn-ota-restore', '#btn-backup-restore',
-    '#btn-reboot', '#btn-factory-reset', '#btn-gh-check', '#gh-target']
+    '#btn-reboot', '#btn-factory-reset']
     .forEach(s => { $(s).disabled = locked; });
-  $('#btn-gh-install').disabled = locked || !ghAvailable; // only with a checked, newer release
 }
 
 const pad2 = n => String(n).padStart(2, '0');
@@ -1261,239 +1258,6 @@ async function startOta() {
   }
 }
 
-// ---------- Firmware / update from GitHub ----------
-// The device does all the work itself (firmware_update.cpp: manifest, download, SHA-256,
-// flash, reboot); this page only starts a run, polls /api/update/status and waits for the
-// reboot. No backup/restore round trip as in startOta(): the device writes its in-RAM config
-// into the fresh LittleFS image before it reboots.
-// /api/update/check answers right away (202, state "checking"); the result arrives in
-// /api/update/status as `check` ("available"/"none"/"failed"/"aborted") once the device has
-// fetched manifest.json (three TLS handshakes on the ESP, typically a few seconds, a failing
-// hop gives up after at most 25 s). /install still answers only once the manifest is there -
-// no fetch timeout. While a run (check or install) is active the device accepts only 1 HTTP
-// connection besides the waiting install request (FW_UPDATE_HTTP_CONNECTIONS), none while it
-// sets up a TLS connection or sends a request (the poll then waits for the TCP retransmit,
-// ~1-3 s), and needs its heap for TLS: the regular polling pauses (otaBusy), only the status
-// is polled.
-const GH_POLL_MS = 1000;
-const GH_POLL_MISSES_MAX = 10; // consecutive failed polls outside of the reboot
-const ghSec = { ind: 'gh-indicator' };
-const GH_STATE_TEXT = { checking: 'Fetching manifest…', downloading: 'Connecting to GitHub…',
-  flashing: 'Writing…', rebooting: 'Restarting…' };
-let ghAvailable = null; // {version, firmware_size, filesystem_size} of the last check with a newer release
-let ghMode = null;      // 'check' | 'install' while this page follows a run
-
-function ghLock(mode) {
-  ghMode = mode;
-  lockOta(!!mode);
-  $('#btn-gh-abort').hidden = !mode;
-}
-
-function ghShowProgress(s) {
-  const bar = $('#gh-progress');
-  bar.hidden = !(s.bytes_total > 0);
-  if (s.bytes_total > 0) bar.value = s.bytes_done / s.bytes_total;
-  $('#gh-msg').textContent = (GH_STATE_TEXT[s.state] || s.state) + (s.bytes_total > 0
-    ? ` ${fmtBytes(s.bytes_done)} of ${fmtBytes(s.bytes_total)} (${Math.round(s.bytes_done * 100 / s.bytes_total)} %)` : '');
-}
-
-function ghFail(text) {
-  const msg = $('#gh-msg');
-  $('#gh-progress').hidden = true;
-  msg.textContent = text;
-  msg.classList.add('warn');
-  setIndicator(ghSec, 'err', 'Failed');
-  ghLock(null);
-}
-
-// One status poll; null if the device did not answer (lossy Wi-Fi: the caller retries).
-async function ghPollStatus() {
-  try {
-    const res = await fetch('/api/update/status', { cache: 'no-store' });
-    return await res.json();
-  } catch (e) {
-    return null;
-  }
-}
-
-// Shows the outcome of a finished check (status fields, see firmware_update.h).
-function ghShowCheck(s) {
-  const msg = $('#gh-msg');
-  if (s.current_version) setText('gh-current', s.current_version);
-  if (s.check === 'available') {
-    ghAvailable = { version: s.available_version, firmware_size: s.firmware_size, filesystem_size: s.filesystem_size };
-    setText('gh-available',
-      `${s.available_version} (firmware ${fmtBytes(s.firmware_size)}, web UI ${fmtBytes(s.filesystem_size)})`);
-    msg.textContent = '';
-    setIndicator(ghSec, 'ok', 'Checked ✓');
-  } else if (s.check === 'none') {
-    ghAvailable = null;
-    setText('gh-available', 'no newer release');
-    msg.textContent = 'The installed version is up to date.';
-    setIndicator(ghSec, 'ok', 'Checked ✓');
-  } else {
-    ghAvailable = null;
-    msg.textContent = s.check === 'aborted' ? 'Check cancelled.' : 'Check failed: ' + (s.error || 'unknown error');
-    msg.classList.add('warn');
-    setIndicator(ghSec, s.check === 'aborted' ? 'warn' : 'err', s.check === 'aborted' ? 'Cancelled' : 'Error');
-  }
-}
-
-// Polls a running check until the device has its result, then shows it.
-async function ghWaitCheck(s) {
-  let misses = 0;
-  while (s.state === 'checking' && s.check === 'running') {
-    await sleep(GH_POLL_MS);
-    const next = await ghPollStatus();
-    if (!next) {
-      if (++misses >= GH_POLL_MISSES_MAX) throw new Error('the device no longer responds');
-      continue;
-    }
-    misses = 0;
-    s = next;
-  }
-  ghShowCheck(s);
-}
-
-async function ghCheck() {
-  const msg = $('#gh-msg');
-  msg.classList.remove('warn');
-  ghLock('check');
-  setIndicator(ghSec, 'saving', 'Checking…');
-  msg.textContent = 'The device is asking GitHub for the latest release…';
-  try {
-    const r = await apiGet('/api/update/check');
-    if ('available' in r) {
-      // Firmware up to 0.3.0 answered the check synchronously
-      ghShowCheck({ check: r.available ? 'available' : 'none', current_version: r.current_version,
-        available_version: r.version, firmware_size: r.firmware_size, filesystem_size: r.filesystem_size });
-    } else {
-      await ghWaitCheck(r); // 202: the device fetches the manifest now
-    }
-  } catch (e) {
-    ghAvailable = null;
-    msg.textContent = 'Check failed: ' + e.message;
-    msg.classList.add('warn');
-    setIndicator(ghSec, 'err', 'Error');
-  }
-  ghLock(null);
-}
-
-async function ghInstall() {
-  if (!ghAvailable || otaBusy) return;
-  const target = $('#gh-target').value, version = ghAvailable.version;
-  if (!confirm(`Install version ${version} from GitHub (${target === 'both' ? 'firmware + web UI' : 'firmware only'})?\n\n` +
-    'The device downloads the update itself, verifies it and then restarts; it is only partly reachable ' +
-    'for about a minute. Settings are preserved. Keep this page open.')) return;
-  const msg = $('#gh-msg');
-  msg.classList.remove('warn');
-  ghLock('install');
-  setIndicator(ghSec, 'saving', 'Updating…');
-  msg.textContent = 'Fetching the manifest again…';
-  try {
-    // version: the device refuses (409) if the release changed since the check
-    await apiPost('/api/update/install', { version, target });
-  } catch (e) {
-    ghFail('Update not started: ' + e.message);
-    return;
-  }
-  ghFollow(target, version);
-}
-
-// Polls the run until the device reboots (or fails), then waits for it like startOta().
-async function ghFollow(target, version) {
-  const msg = $('#gh-msg');
-  let last = null, misses = 0;
-  for (;;) {
-    await sleep(GH_POLL_MS);
-    const s = await ghPollStatus();
-    if (!s) {
-      // The restart follows 300 ms after "rebooting", so the device may vanish before
-      // a poll ever sees that state: a vanished device with everything written is the reboot.
-      if (last && (last.state === 'rebooting' || (last.bytes_total > 0 && last.bytes_done >= last.bytes_total))) break;
-      if (++misses >= GH_POLL_MISSES_MAX) { ghFail('The device no longer responds.'); return; }
-      continue;
-    }
-    misses = 0;
-    last = s;
-    ghShowProgress(s);
-    if (s.state === 'rebooting') break;
-    if (s.state === 'error') {
-      ghFail(/^aborted/.test(s.error) ? 'Update cancelled.' + s.error.replace(/^aborted/, '') : 'Update failed: ' + s.error);
-      return;
-    }
-    if (s.state === 'idle') { ghFail('Update ended without installing anything.'); return; }
-  }
-  $('#gh-progress').hidden = true;
-  msg.textContent = 'Update written - device is restarting…';
-  try {
-    const info = await waitForDevice();
-    await loadSystem();
-    if (info.fw_version !== version) {
-      ghFail(`The device is running again, but reports version ${orDash(info.fw_version)} instead of ${version}.`);
-      return;
-    }
-    ghAvailable = null;
-    setText('gh-available', 'installed');
-    setIndicator(ghSec, 'ok', 'Done ✓');
-    if (target === 'both') {
-      // New index.html/app.js/style.css on the device: this page is outdated now
-      msg.textContent = `Version ${version} installed - reloading…`;
-      setTimeout(() => { otaBusy = false; location.reload(); }, 3000); // no beforeunload prompt
-      return;
-    }
-    msg.textContent = `Version ${version} installed.`;
-    ghLock(null);
-  } catch (e) {
-    ghFail(e.message);
-  }
-}
-
-// Cancels the run this page follows; the loop of ghWaitCheck()/ghFollow() then sees the end.
-async function ghAbort() {
-  if (ghMode !== 'check' && !confirm('Cancel the update? A firmware that is already staged stays staged; a half-written ' +
-    'filesystem must be installed again afterwards (do not restart the device until then).')) return;
-  try {
-    await apiPost('/api/update/install', { abort: true });
-    $('#gh-msg').textContent = 'Cancelling…';
-  } catch (e) {
-    $('#gh-msg').textContent = 'Cancel failed: ' + e.message;
-  }
-}
-
-// Opening the tab picks up a run that is already going (reload, second browser tab),
-// shows the result of the last check and the error of the last failed update.
-async function ghResume() {
-  if (otaBusy) return;
-  try {
-    const s = await apiGet('/api/update/status');
-    // "checking" without a target is a plain check
-    if (s.state === 'downloading' || s.state === 'flashing' || (s.state === 'checking' && s.target)) {
-      ghLock('install');
-      setIndicator(ghSec, 'saving', 'Updating…');
-      ghShowProgress(s);
-      ghFollow(s.target, s.version);
-    } else if (s.state === 'checking') {
-      ghLock('check');
-      setIndicator(ghSec, 'saving', 'Checking…');
-      $('#gh-msg').textContent = 'The device is asking GitHub for the latest release…';
-      try {
-        await ghWaitCheck(s);
-      } catch (e) {
-        $('#gh-msg').textContent = 'Check failed: ' + e.message;
-        $('#gh-msg').classList.add('warn');
-      }
-      ghLock(null);
-    } else if (s.state === 'error') {
-      $('#gh-msg').textContent = 'Last update failed: ' + s.error;
-      $('#gh-msg').classList.add('warn');
-    } else if (s.check && s.check !== 'running') {
-      ghShowCheck(s);
-      $('#btn-gh-install').disabled = !ghAvailable;
-    }
-  } catch (e) { /* older firmware without /api/update: nothing to show */ }
-}
-
 // ---------- Init ----------
 buildShapeCards('zone');
 buildShapeCards('object');
@@ -1532,12 +1296,8 @@ $('#ota-restore-input').addEventListener('change', e => {
 $('#ota-fw-file').addEventListener('change', () => refreshOtaHint('firmware'));
 $('#ota-fs-file').addEventListener('change', () => refreshOtaHint('filesystem'));
 $('#btn-ota-start').addEventListener('click', startOta);
-$('#btn-gh-check').addEventListener('click', ghCheck);
-$('#btn-gh-install').addEventListener('click', ghInstall);
-$('#btn-gh-abort').addEventListener('click', ghAbort);
 // Leaving mid-run would drop the upload and the automatic config restore.
-// A running check can be left safely (it ends on its own), an update run cannot
-window.addEventListener('beforeunload', e => { if (otaBusy && ghMode !== 'check') e.preventDefault(); });
+window.addEventListener('beforeunload', e => { if (otaBusy) e.preventDefault(); });
 window.addEventListener('resize', scaleMaps);
 scaleMaps();
 // Zone + object config is also needed for the status map and zone list.

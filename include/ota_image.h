@@ -3,10 +3,10 @@
 #include <Arduino.h>
 #include <flash_hal.h>
 
-// Bildprüfungen und Größengrenzen für OTA-Images, gemeinsam genutzt vom
-// Datei-Upload im Web-UI (web_server.cpp, /api/firmware + /api/filesystem) und
-// vom Update direkt von GitHub (firmware_update.cpp). Beide Wege schreiben in
-// dieselben Flash-Bereiche und müssen deshalb exakt dieselben Grenzen ziehen.
+// Bildprüfungen und Größengrenzen für OTA-Images des Datei-Uploads
+// (web_server.cpp, /api/firmware + /api/filesystem, auch von der Recovery-Seite
+// und per curl). Alles, was ein Image ablehnen kann, läuft vor Update.begin(),
+// also vor dem ersten Löschen im Flash.
 
 // Flash layout values, kept in one place. FS_PHYS_SIZE / FS_PHYS_BLOCK (the
 // LittleFS partition) come from the core (flash_hal.h, via the linker symbols

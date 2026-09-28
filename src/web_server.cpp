@@ -4,7 +4,6 @@
 #include "event_log.h"
 #include "wifi_power.h"
 #include "firmware.h"
-#include "firmware_update.h"
 #include "ota_image.h"
 
 #include <ESP8266WiFi.h>
@@ -39,10 +38,10 @@ static const uint8_t MAX_HTTP_CONNECTIONS = 4;
 
 static tcp_pcb_listen *s_httpListener = nullptr;
 
-// Wartender install-Request des Updates von GitHub (registerUpdateRoutes). Hier oben,
-// weil das Verbindungslimit ihn nicht mitzählt.
-static AsyncWebServerRequest *s_updateRequest = nullptr;
-
+// Setzt das Listen-Backlog so, dass lwIP nur noch so viele Handshakes annimmt,
+// wie Plätze frei sind (Handshakes im SYN_RCVD zählt lwIP selbst gegen das
+// Backlog, bei 0 werden alle SYNs verworfen).
+//
 // Gezählt werden nur Verbindungen, die noch einen AsyncClient haben (tcp_arg
 // gesetzt; ESPAsyncTCP löscht es beim Schließen). Die pcbs selbst leben nach
 // dem Schließen weiter, im FIN_WAIT_2 bis zu 20 s, wenn die Gegenseite ihr FIN
@@ -50,34 +49,13 @@ static AsyncWebServerRequest *s_updateRequest = nullptr;
 // nach 3 s Leerlauf schließt. Gemessen: vier solche Verbindungen blockierten
 // den Server mit lwIPs eigener Zählung (tcp_backlog_delayed) 20 s lang, obwohl
 // sie kaum noch Heap belegen.
-// Nicht mitgezählt: der wartende install-Request (tcp_arg ist sein AsyncClient) - sein
-// Heap ist belegt, bevor der Automat misst, und wächst bis zur Antwort nicht mehr.
-// withHandshakes: auch Handshakes im SYN_RCVD (noch ohne AsyncClient, gleich mit einem).
-static uint8_t countHttpConnections(bool withHandshakes) {
-    const void *held = s_updateRequest ? s_updateRequest->client() : nullptr;
-    uint8_t open = 0;
-    for (tcp_pcb *pcb = tcp_active_pcbs; pcb; pcb = pcb->next) {
-        if (pcb->local_port != HTTP_PORT) continue;
-        if (pcb->state == SYN_RCVD) {
-            if (withHandshakes) open++;
-        } else if (pcb->callback_arg && pcb->callback_arg != held) {
-            open++;
-        }
-    }
-    return open;
-}
-
-// Setzt das Listen-Backlog so, dass lwIP nur noch so viele Handshakes annimmt,
-// wie Plätze frei sind (Handshakes im SYN_RCVD zählt lwIP selbst gegen das
-// Backlog, bei 0 werden alle SYNs verworfen).
 static void updateConnectionLimit() {
     if (!s_httpListener) return;
-    const uint8_t open = countHttpConnections(false);
-    // Während eines Updates von GitHub belegt TLS den Heap, den sonst die
-    // übrigen Verbindungen brauchen (siehe FW_UPDATE_HTTP_CONNECTIONS); 0 während
-    // der Webserver-Pause (firmwareUpdateHttpConnections)
-    const uint8_t limit = firmwareUpdateBusy() ? firmwareUpdateHttpConnections() : MAX_HTTP_CONNECTIONS;
-    s_httpListener->backlog = open >= limit ? 0 : limit - open;
+    uint8_t open = 0;
+    for (tcp_pcb *pcb = tcp_active_pcbs; pcb; pcb = pcb->next) {
+        if (pcb->local_port == HTTP_PORT && pcb->state != SYN_RCVD && pcb->callback_arg) open++;
+    }
+    s_httpListener->backlog = open >= MAX_HTTP_CONNECTIONS ? 0 : MAX_HTTP_CONNECTIONS - open;
 }
 
 // AsyncWebServer, der bei jeder neuen Verbindung das Limit nachführt; beim
@@ -1174,8 +1152,10 @@ static void registerEventRoutes() {
     });
 }
 
+// Neustart REBOOT_DELAY_MS (300 ms) später aus webServerLoop(), damit die
+// laufende HTTP-Antwort noch hinausgeht; loggt Reboot bzw. FactoryReset.
 // The log entry is lost with the restart; the next boot logs its reset reason.
-void webServerScheduleReboot(bool factoryReset) {
+static void webServerScheduleReboot(bool factoryReset) {
     eventLogPush(factoryReset ? EventType::FactoryReset : EventType::Reboot,
                  factoryReset ? "Factory reset, rebooting" : "Reboot requested");
     s_rebootPending = true;
@@ -1241,9 +1221,7 @@ static void registerConfigBackupRoutes() {
 
 // Flash layout values, size limits and the image checks (LD_IROM0_SEG_LEN,
 // FIRMWARE_BIN_MAX_BYTES, otaFirmwareMaxBytes(), otaCheckLittleFsImage(), ...)
-// live in ota_image.h/.cpp: the device-side update from GitHub
-// (firmware_update.cpp) writes the same flash regions and must enforce exactly
-// the same bounds.
+// live in ota_image.h/.cpp.
 
 // Framing that browsers/curl add around the file part (boundary lines + part
 // headers, typically ~200 bytes). Only used to judge Content-Length when the
@@ -1309,13 +1287,6 @@ static void otaBegin(AsyncWebServerRequest *request, OtaKind kind, OtaUploadStat
     }
     if (s_rebootPending) {
         otaSetError(st, 409, "device is rebooting");
-        return;
-    }
-    // Das Update von GitHub hält den Updater nicht durchgehend (Manifest,
-    // Redirects, Pause zwischen Firmware und Dateisystem): Update.isRunning()
-    // allein würde einen Upload mitten in einen Lauf "both" hineinlassen.
-    if (firmwareUpdateBusy()) {
-        otaSetError(st, 409, "update from GitHub in progress");
         return;
     }
     // declared == 0 means "not sent"; a size that is sent must be usable, so
@@ -1509,197 +1480,6 @@ static void registerOtaRoutes() {
         });
 }
 
-// ---------------------------------------------------------------------------
-// Update direkt von GitHub (Automat in firmware_update.cpp)
-//
-//   GET  /api/update/check    startet nur den Lauf und antwortet sofort:
-//                             202 + Status-Objekt (state "checking", check "running").
-//                             Das Ergebnis steht danach in /api/update/status.
-//                             409 Neustart angesetzt / Datei-Upload läuft,
-//                             503 Lauf läuft schon / kein Heap für den Lauf.
-//   POST /api/update/install  {"version"?: "0.3.1", "target"?: "firmware"|"both"} -> 202
-//                             {state, version}; {"abort": true} bricht einen Lauf ab
-//                             (auch einen check): 202 + Status, 200 wenn keiner lief
-//   GET  /api/update/status   immer 200: {state, target, version, bytes_done, bytes_total,
-//                             check, current_version[, available_version, firmware_size,
-//                             filesystem_size], error} - Felder: firmware_update.h
-//
-// check wartet nicht mehr auf das Manifest: drei TLS-Handshakes dauern bis zu
-// 3 x (10 s TCP + 15 s TLS), und ein offener Request hielt einen der
-// Verbindungsplätze eines Laufs (FW_UPDATE_HTTP_CONNECTIONS) samt Heap. Die UI
-// fragt ohnehin /api/update/status ab. Nur install antwortet weiterhin erst mit
-// dem Manifest (der Vertrag will 409 bei geänderter Version): der Request wartet
-// in s_updateRequest und wird aus webServerLoop() beantwortet (answerUpdateRequest);
-// ESPAsyncTCP ist dafür nicht auf den Callback-Kontext angewiesen, loop() und lwIP
-// laufen auf dem ESP8266 nie gleichzeitig. Das TLS selbst läuft nie im
-// Request-Handler (lwIP-Kontext, dort panict yield()), sondern im Automaten aus
-// webServerLoop().
-// ---------------------------------------------------------------------------
-
-// Wartezeit des install-Requests auf das Manifest. Das RX-Timeout von 3 s
-// (LimitedWebServer) würde ihn vorher schließen: drei Hops mit je einem
-// TLS-Handshake (typisch 1-2 s). Scheitert ein Hop an den Timeouts des Automaten
-// (bis 25 s), kommt die Fehlerantwort trotzdem noch vor diesen 60 s.
-static const uint8_t UPDATE_REQUEST_RX_TIMEOUT_S = 60;
-
-// /api/update/status ohne Heap außer dem Response-Objekt selbst: sendJsonDoc()
-// antwortet bei knappem Heap mit 503, der Status muss aber gerade während des
-// TLS-Downloads (Heap knapp) immer 200 liefern.
-class FixedJsonResponse : public PiecewiseResponse {
-  public:
-    explicit FixedJsonResponse(int code) : PiecewiseResponse(code) {
-        _len = firmwareUpdateStatusToJson(_body, sizeof(_body));
-    }
-
-  protected:
-    size_t bodyLength() const override { return _len; }
-
-    bool nextPiece(const char *&data, size_t &len) override {
-        if (_handedOut) return false;
-        _handedOut = true;
-        data = _body;
-        len = _len;
-        return true;
-    }
-
-  private:
-    char _body[FW_STATUS_JSON_MAX];
-    size_t _len;
-    bool _handedOut = false;
-};
-
-static void sendUpdateStatus(AsyncWebServerRequest *request, int code) {
-    sendResponse(request, new (std::nothrow) FixedJsonResponse(code));
-}
-
-// Gemeinsame Sperren von check und install, in dieser Reihenfolge (Vertrag):
-// Neustart angesetzt -> 409, eigener Lauf aktiv -> 503, Datei-Upload -> 409.
-static bool updateStartAllowed(AsyncWebServerRequest *request) {
-    if (s_rebootPending) {
-        sendJsonError(request, 409, "device is rebooting");
-        return false;
-    }
-    if (firmwareUpdateBusy() || s_updateRequest) {
-        sendJsonError(request, 503, "update check or install already running");
-        return false;
-    }
-    if (Update.isRunning()) {
-        sendJsonError(request, 409, "OTA upload in progress");
-        return false;
-    }
-    return true;
-}
-
-static void holdUpdateRequest(AsyncWebServerRequest *request) {
-    s_updateRequest = request;
-    request->client()->setRxTimeout(UPDATE_REQUEST_RX_TIMEOUT_S);
-    // Geht der Client vorher, läuft der Automat trotzdem weiter (ein Install
-    // wird über /api/update/status verfolgt); nur die Antwort entfällt.
-    request->onDisconnect([]() { s_updateRequest = nullptr; });
-}
-
-// Aus webServerLoop(): beantwortet den wartenden install-Request, sobald das Manifest da ist.
-static void answerUpdateRequest() {
-    if (!s_updateRequest) return;
-    FwManifestInfo info;
-    const char *error = "";
-    FwManifestOutcome outcome = firmwareUpdateManifestOutcome(info, error);
-    if (outcome == FwManifestOutcome::Pending) return;
-
-    AsyncWebServerRequest *request = s_updateRequest;
-    s_updateRequest = nullptr;
-    request->onDisconnect(nullptr); // sonst löscht das spätere Disconnect einen neuen s_updateRequest
-    JsonDocument doc;
-    int code = 200;
-    switch (outcome) {
-        case FwManifestOutcome::Failed:
-            // Manifest nicht erreichbar oder ungültig: Fehler der Gegenstelle
-            code = 502;
-            doc["error"] = error;
-            break;
-        case FwManifestOutcome::Aborted:
-            code = 409;
-            doc["error"] = "aborted";
-            break;
-        case FwManifestOutcome::VersionMismatch:
-            code = 409;
-            doc["error"] = String("the manifest now offers version ") + info.version;
-            doc["version"] = info.version;
-            break;
-        case FwManifestOutcome::NoUpdate:
-            code = 409;
-            doc["error"] = "no update available";
-            doc["current_version"] = FIRMWARE_VERSION;
-            doc["available"] = false;
-            break;
-        default: // UpdateAvailable
-            code = 202;
-            doc["state"] = "downloading";
-            doc["version"] = info.version;
-            break;
-    }
-    sendJsonDoc(request, code, doc);
-}
-
-static void registerUpdateRoutes() {
-    // Antwortet sofort; der Automat holt das Manifest in webServerLoop()
-    server.on("/api/update/check", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!updateStartAllowed(request)) return;
-        if (!firmwareUpdateStartCheck()) {
-            sendJsonError(request, 503, "out of memory, retry");
-            return;
-        }
-        sendUpdateStatus(request, 202);
-    });
-
-    registerJsonPost(server, "/api/update/install", MAX_BODY_LEN,
-        [](JsonDocument &body, JsonDocument &resp, AsyncWebServerRequest *request) {
-            (void)resp; // alle Antworten gehen direkt bzw. verzögert hinaus
-            if (!requireObject(body, request)) return;
-            JsonObjectConst o = body.as<JsonObjectConst>();
-            String err;
-            if (!validateBool(o, "abort", err) ||
-                !validateString(o, "version", 1, FW_VERSION_MAX_LEN - 1, err) ||
-                !validateString(o, "target", 1, 16, err)) {
-                sendJsonError(request, 400, err);
-                return;
-            }
-
-            // Abbruch: 202, solange der Automat noch aufräumen muss (nächster
-            // Takt), 200 wenn nichts lief; der Body ist jeweils der Status.
-            if (o["abort"] | false) {
-                if (s_rebootPending) {
-                    sendJsonError(request, 409, "device is rebooting");
-                    return;
-                }
-                bool running = firmwareUpdateRequestAbort();
-                sendUpdateStatus(request, running ? 202 : 200);
-                return;
-            }
-
-            FwUpdateTarget target = FwUpdateTarget::Both;
-            if (!o["target"].isNull() && !firmwareUpdateParseTarget(o["target"].as<const char *>(), target)) {
-                sendJsonError(request, 400, "target must be \"firmware\" or \"both\"");
-                return;
-            }
-            const char *version = o["version"].as<const char *>();
-            if (version && !firmwareUpdateVersionValid(version)) {
-                sendJsonError(request, 400, "version must be numeric, e.g. \"0.3.1\"");
-                return;
-            }
-            if (!updateStartAllowed(request)) return;
-            if (!firmwareUpdateStartInstall(target, version)) {
-                sendJsonError(request, 503, "out of memory, retry");
-                return;
-            }
-            holdUpdateRequest(request);
-        });
-
-    server.on("/api/update/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-        sendUpdateStatus(request, 200);
-    });
-}
-
 // Served instead of index.html when the filesystem holds no web UI - after an
 // interrupted filesystem update (main.cpp formats the unmountable partition
 // on the next boot) or while an image is being written. Without it the device
@@ -1715,14 +1495,7 @@ Upload the filesystem image (<code>littlefs.bin</code>) again.</p>
 <p><label>Firmware (.bin, optional): <input type="file" id="fw" accept=".bin"></label></p>
 <p><label>Filesystem image: <input type="file" id="fs" accept=".bin,.fs"></label></p>
 <p><button onclick="go()">Upload</button> <span id="m"></span></p>
-<p>Or without files: <button onclick="gh()">Install update from GitHub</button> (firmware + web UI)</p>
 <script>
-function st(){fetch('/api/update/status').then(function(r){return r.json()}).then(function(s){
-m.textContent=s.state+(s.bytes_total?' '+Math.round(s.bytes_done*100/s.bytes_total)+' %':'')+(s.error?' - '+s.error:'');
-if(s.state=='rebooting')m.textContent='Done - restarting, reload the page in 30 s.';else if(s.state!='idle'&&s.state!='error')setTimeout(st,1000)})
-.catch(function(){setTimeout(st,2000)})}
-function gh(){m.textContent='Checking GitHub...';fetch('/api/update/install',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"target":"both"}'})
-.then(function(r){return r.json().then(function(j){if(!r.ok)throw j.error||r.status;st()})}).catch(function(e){m.textContent='Error: '+e})}
 function up(f,u,r){return new Promise(function(ok,no){var x=new XMLHttpRequest(),d=new FormData();d.append('file',f);
 x.open('POST',u+'?size='+f.size+(r?'':'&reboot=0'));x.upload.onprogress=function(e){m.textContent=f.name+': '+Math.round(e.loaded*100/e.total)+' %'};
 x.onload=function(){x.status==200?ok():no(x.responseText)};x.onerror=function(){no('connection lost')};x.send(d)})}
@@ -1761,10 +1534,8 @@ static void registerSystemRoutes() {
     // and during a filesystem upload the partition is already unmounted and
     // partially overwritten - the reboot would come up with a broken or freshly
     // formatted filesystem. Checked before any mutation (factory reset too).
-    // Das Update von GitHub zählt mit, auch zwischen zwei Assets, wenn der
-    // Updater gerade frei ist (firmwareUpdateBusy()).
     server.on("/api/reboot", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (Update.isRunning() || firmwareUpdateBusy()) {
+        if (Update.isRunning()) {
             sendJsonError(request, 409, "OTA update in progress");
             return;
         }
@@ -1775,7 +1546,7 @@ static void registerSystemRoutes() {
     });
 
     server.on("/api/factory-reset", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (Update.isRunning() || firmwareUpdateBusy()) {
+        if (Update.isRunning()) {
             sendJsonError(request, 409, "OTA update in progress");
             return;
         }
@@ -1795,7 +1566,7 @@ static void registerSystemRoutes() {
     // WiFiManager::resetSettings() delay()s, which is not allowed in an async
     // callback (WiFiManager.h also cannot be included here, see web_server.h).
     server.on("/api/wifi/reset", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (Update.isRunning() || firmwareUpdateBusy()) {
+        if (Update.isRunning()) {
             sendJsonError(request, 409, "OTA update in progress");
             return;
         }
@@ -1836,7 +1607,6 @@ static void registerStaticRoutes() {
 
 void webServerBegin(AppConfig &cfg) {
     s_cfg = &cfg;
-    firmwareUpdateBegin(cfg);
     s_bootPins[0] = cfg.ld2450.rxPin;
     s_bootPins[1] = cfg.ld2450.txPin;
     s_bootPins[2] = cfg.bh1750.sdaPin;
@@ -1857,7 +1627,6 @@ void webServerBegin(AppConfig &cfg) {
     registerEventRoutes();
     registerConfigBackupRoutes();
     registerOtaRoutes();
-    registerUpdateRoutes();
     registerSystemRoutes();
     registerStaticRoutes();
 
@@ -1870,18 +1639,8 @@ void webServerBegin(AppConfig &cfg) {
     umm_free_heap_size_min_reset();
 }
 
-uint8_t webServerOpenConnections() {
-    return countHttpConnections(true);
-}
-
-void webServerApplyConnectionLimit() {
-    updateConnectionLimit();
-}
-
 void webServerLoop() {
     updateConnectionLimit();
-    firmwareUpdateLoop();
-    answerUpdateRequest();
 
     if (s_rebootPending && millis() - s_rebootRequestedAt >= REBOOT_DELAY_MS) {
         if (s_wifiResetPending) {

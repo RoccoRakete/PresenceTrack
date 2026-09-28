@@ -29,8 +29,7 @@ AppConfig g_appConfig;
 // change (configHash) or the power is cycled.
 // A wrong IP still "connects" (WL_CONNECTED only means associated), so a boot
 // also counts as failed if the gateway does not answer ARP.
-// RTC user blocks 64-66 (4-B blocks): 0-31 hold eboot_command, 96-99 the crash
-// mark of firmware_update.cpp.
+// RTC user blocks 64-66 (4-B blocks): 0-31 hold eboot_command.
 // ---------------------------------------------------------------------------
 
 static const uint8_t STATIC_IP_MAX_FAILS = 3;
@@ -133,7 +132,7 @@ void setup()
     if (applyStaticIp)
     {
         // Validated by POST /api/config/wifi; an empty DNS falls back to the gateway,
-        // without any DNS server the MQTT broker name and the GitHub update would not resolve
+        // without any DNS server the MQTT broker name would not resolve
         IPAddress ip, subnet, dns;
         ip.fromString(wc.staticIp);
         gateway.fromString(wc.gateway);

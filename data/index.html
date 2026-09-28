@@ -224,25 +224,6 @@
       <p class="muted">Build the firmware: <code>pio run</code> → <code>.pio/build/d1_mini/firmware.bin</code>.
         Build the filesystem image (web UI from <code>data/</code>): <code>pio run -t buildfs</code> → <code>.pio/build/d1_mini/littlefs.bin</code>.</p>
     </div>
-    <div class="card" id="gh-update-card">
-      <h2>Update from GitHub <span id="gh-indicator" class="save-indicator"></span></h2>
-      <p class="muted">The device downloads the latest release from <code>github.com/RoccoRakete/PresenceTrack</code> itself
-        and writes it to flash - no PC and no file upload needed. Settings are preserved.</p>
-      <div class="row"><span>Installed</span><span id="gh-current">–</span></div>
-      <div class="row"><span>Available</span><span id="gh-available">–</span></div>
-      <div class="row"><span>Scope</span>
-        <select id="gh-target">
-          <option value="both">Firmware + web UI</option>
-          <option value="firmware">Firmware only</option>
-        </select></div>
-      <progress id="gh-progress" class="ota-progress" max="1" value="0" hidden></progress>
-      <div id="gh-msg" class="muted"></div>
-      <div class="actions">
-        <button type="button" id="btn-gh-check" class="btn">Check for update</button>
-        <button type="button" id="btn-gh-install" class="btn primary" disabled>Update now</button>
-        <button type="button" id="btn-gh-abort" class="btn danger" hidden>Cancel</button>
-      </div>
-    </div>
     <div class="card" id="ota-card">
       <h2>Upload Update <span id="ota-indicator" class="save-indicator"></span></h2>
       <p class="muted warn">The device is unreachable during the update and the following restart (about 1 minute). Keep this page open.</p>

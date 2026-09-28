@@ -11,18 +11,5 @@
 void webServerBegin(AppConfig &cfg);
 
 // Must be called regularly from loop() (delayed restart after /api/reboot or
-// /api/factory-reset; gibt Plätze des HTTP-Verbindungslimits wieder frei;
-// taktet das Update von GitHub, firmware_update.h).
+// /api/factory-reset; gibt Plätze des HTTP-Verbindungslimits wieder frei).
 void webServerLoop();
-
-// Neustart REBOOT_DELAY_MS (300 ms) später aus webServerLoop(), damit die
-// laufende HTTP-Antwort noch hinausgeht; loggt Reboot bzw. FactoryReset.
-// Öffentlich für firmware_update.cpp (Neustart nach einem Update von GitHub).
-void webServerScheduleReboot(bool factoryReset);
-
-// Für die Webserver-Pause des Updates von GitHub (firmware_update.cpp):
-// Offene HTTP-Verbindungen samt angenommener Handshakes (SYN_RCVD), ohne den wartenden
-// install-Request - dessen Heap ist schon belegt und wächst bis zur Antwort nicht mehr.
-uint8_t webServerOpenConnections();
-// Setzt das Verbindungslimit sofort statt erst im nächsten webServerLoop().
-void webServerApplyConnectionLimit();

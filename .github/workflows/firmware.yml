@@ -15,30 +15,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: FIRMWARE_VERSION aus include/firmware.h lesen
+      - name: Read FIRMWARE_VERSION from include/firmware.h
         id: version
         run: |
           set -euo pipefail
           version=$(grep -oP '#define FIRMWARE_VERSION "\K[0-9.]+' include/firmware.h)
           if [ -z "$version" ]; then
-            echo "Konnte FIRMWARE_VERSION nicht aus include/firmware.h lesen" >&2
+            echo "Could not read FIRMWARE_VERSION from include/firmware.h" >&2
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "FIRMWARE_VERSION=$version"
 
-      # Vertrag mit der Firmware (include/firmware.h, Kommentar bei FIRMWARE_VERSION):
-      # ein Tag-Build MUSS exakt v<FIRMWARE_VERSION> heissen. Das Geraet
-      # (firmware_update.cpp, compareVersions) vergleicht diese Version mit dem
-      # Manifest - weicht der Tag ab, bietet es ein Release entweder endlos
-      # erneut an oder nie.
-      - name: Tag gegen FIRMWARE_VERSION pruefen
+      # Contract with the firmware (include/firmware.h, comment at FIRMWARE_VERSION):
+      # a tag build MUST be named exactly v<FIRMWARE_VERSION>. Otherwise the
+      # release assets would carry a different version in their names than the
+      # device reports under /api/system (fw_version) after the upload.
+      - name: Check tag against FIRMWARE_VERSION
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         run: |
           set -euo pipefail
           expected="v${{ steps.version.outputs.version }}"
           if [ "${{ github.ref_name }}" != "$expected" ]; then
-            echo "Tag ${{ github.ref_name }} passt nicht zu FIRMWARE_VERSION ${{ steps.version.outputs.version }} (erwartet $expected)" >&2
+            echo "Tag ${{ github.ref_name }} does not match FIRMWARE_VERSION ${{ steps.version.outputs.version }} (expected $expected)" >&2
             exit 1
           fi
 
@@ -46,7 +45,7 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: PlatformIO-Cache
+      - name: PlatformIO cache
         uses: actions/cache@v4
         with:
           path: ~/.platformio
@@ -54,25 +53,25 @@ jobs:
           restore-keys: |
             platformio-${{ runner.os }}-
 
-      - name: PlatformIO installieren
+      - name: Install PlatformIO
         run: pip install --upgrade platformio
 
-      - name: Firmware und Dateisystem bauen
-        # "pio run -t buildfs" baut bei einem frischen Checkout nur das
-        # Dateisystem-Image, nicht die Firmware - beide Targets brauchen
-        # getrennte Aufrufe, um firmware.bin UND littlefs.bin zu erhalten.
+      - name: Build firmware and filesystem
+        # On a fresh checkout "pio run -t buildfs" builds only the filesystem
+        # image, not the firmware - both targets need separate invocations to
+        # get firmware.bin AND littlefs.bin.
         run: |
           pio run
           pio run -t buildfs
 
-      - name: firmware.bin hochladen
+      - name: Upload firmware.bin
         uses: actions/upload-artifact@v4
         with:
           name: firmware
           path: .pio/build/d1_mini/firmware.bin
           if-no-files-found: error
 
-      - name: littlefs.bin hochladen
+      - name: Upload littlefs.bin
         uses: actions/upload-artifact@v4
         with:
           name: littlefs
@@ -100,51 +99,35 @@ jobs:
           name: littlefs
           path: dist
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Assets benennen, manifest.json erzeugen und validieren
+      - name: Name assets and generate checksums
         id: assets
         run: |
           set -euo pipefail
           version="${{ needs.build.outputs.version }}"
-          tag="${{ github.ref_name }}"
           fw_name="presencetrack-${version}-firmware.bin"
           fs_name="presencetrack-${version}-littlefs.bin"
+          sums_name="presencetrack-${version}-checksums.txt"
           mv "dist/firmware.bin" "dist/${fw_name}"
           mv "dist/littlefs.bin" "dist/${fs_name}"
 
-          python3 .github/scripts/gen_manifest.py \
-            --version "$version" --tag "$tag" --board d1_mini \
-            --commit "$(git rev-parse HEAD)" \
-            --firmware "dist/${fw_name}" --firmware-name "$fw_name" \
-            --filesystem "dist/${fs_name}" --filesystem-name "$fs_name" \
-            --out "dist/manifest.json"
-
-          # Zweite, unabhaengige Pruefung: manifest.json so lesen, wie es
-          # spaeter aus dem Release kommt (Struktur + echte Assets).
-          python3 .github/scripts/check_manifest.py "dist/manifest.json" \
-            --firmware "dist/${fw_name}" --filesystem "dist/${fs_name}"
-
-          (cd dist && sha256sum "${fw_name}" "${fs_name}" manifest.json > checksums.txt)
+          (cd dist && sha256sum "${fw_name}" "${fs_name}" > "${sums_name}")
 
           echo "fw_name=${fw_name}" >> "$GITHUB_OUTPUT"
           echo "fs_name=${fs_name}" >> "$GITHUB_OUTPUT"
+          echo "sums_name=${sums_name}" >> "$GITHUB_OUTPUT"
 
-      - name: Release-Notizen zusammenstellen
+      - name: Assemble release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           tag="${{ github.ref_name }}"
-          # Nicht "git tag -l --format=%(contents)" auf dem lokalen Checkout:
-          # actions/checkout legt den Tag beim Auschecken eines Tag-Refs als
-          # lokale Referenz direkt auf den Commit an, ohne das Tag-Objekt
-          # (samt Annotation) zu uebernehmen - "%(contents)" liefert dann
-          # unbemerkt die Commit-Message statt der Tag-Message. Stattdessen
-          # das Tag-Objekt ueber die API lesen, das ist unabhaengig vom
-          # lokalen Checkout-Zustand.
+          # Not "git tag -l --format=%(contents)" on the local checkout: when
+          # checking out a tag ref, actions/checkout creates the tag as a local
+          # ref pointing straight at the commit, without fetching the tag object
+          # (including its annotation) - "%(contents)" then silently returns the
+          # commit message instead of the tag message. Read the tag object via
+          # the API instead, which does not depend on the local checkout state.
           tag_sha="$(gh api "repos/${{ github.repository }}/git/refs/tags/$tag" --jq .object.sha)"
           tag_type="$(gh api "repos/${{ github.repository }}/git/refs/tags/$tag" --jq .object.type)"
           if [ "$tag_type" = "tag" ]; then
@@ -160,16 +143,16 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "**Update auf dem Geraet:** Web-Oberflaeche -> Tab \"Firmware\" -> \"Update von GitHub\"."
+            echo "**Updating the device:** download both files and upload them in the web UI"
+            echo "under the \"Firmware\" tab, or flash via USB with \`flash.sh\`."
             echo ""
-            echo "**Dateien in diesem Release:**"
-            echo "- \`${{ steps.assets.outputs.fw_name }}\` - Firmware"
-            echo "- \`${{ steps.assets.outputs.fs_name }}\` - Dateisystem (Web-UI aus data/)"
-            echo "- \`manifest.json\` - Update-Manifest, das das Geraet abfragt"
-            echo "- \`checksums.txt\` - sha256 aller Assets"
+            echo "**Files in this release:**"
+            echo "- \`${{ steps.assets.outputs.fw_name }}\` - firmware"
+            echo "- \`${{ steps.assets.outputs.fs_name }}\` - filesystem (web UI from data/)"
+            echo "- \`${{ steps.assets.outputs.sums_name }}\` - sha256 of both images"
           } > release-notes.md
 
-      - name: Release veroeffentlichen
+      - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -177,8 +160,7 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             "dist/${{ steps.assets.outputs.fw_name }}" \
             "dist/${{ steps.assets.outputs.fs_name }}" \
-            "dist/manifest.json" \
-            "dist/checksums.txt" \
+            "dist/${{ steps.assets.outputs.sums_name }}" \
             --title "PresenceTrack ${{ github.ref_name }}" \
             --notes-file release-notes.md \
             --verify-tag

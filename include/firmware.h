@@ -9,21 +9,14 @@
 // config layout only changes with some releases, and a firmware that keeps the
 // layout must not look like a schema change in /config.json backups.
 //
-// Muss exakt zum GitHub-Release-Tag v<FIRMWARE_VERSION> passen: die CI prüft
-// das beim Release, und das Update von GitHub (firmware_update.cpp) vergleicht
-// diese Version mit "version" aus manifest.json - weicht sie ab, bietet das
-// Gerät ein Release entweder endlos erneut an oder nie. Nur Ziffern und Punkte,
-// höchstens drei Segmente (firmwareUpdateVersionValid).
+// Muss exakt zum GitHub-Release-Tag v<FIRMWARE_VERSION> passen: die CI
+// (.github/workflows/firmware.yml) prüft das bei jedem Tag-Build und
+// veröffentlicht bei Abweichung kein Release - sonst trügen die Release-Assets
+// eine andere Fassung im Namen, als das Gerät nach dem Upload unter /api/system
+// meldet.
 //
-// 0.3.1: Patch für das Update von GitHub in 0.3.0 (veröffentlicht und defekt). Der
-// check blockierte den Webserver-Request bis zum Manifest, DNS/TCP/TLS-Fehler kamen
-// als nichtssagendes "BearSSL error 0" an, und der Empfangspuffer hing vom Host ab.
-// Siehe Kopfkommentar in firmware_update.cpp. Das Konfigurationsformat ist
-// unverändert (CONFIG_SCHEMA_VERSION bleibt).
-//
-// 0.3.2: 0.3.1 wurde nie veröffentlicht (nur auf main). Der check läuft jetzt auf
-// dem echten Gerät über beide github.com-Hops und das CDN durch, das Manifest wird
-// geparst, und der Speicherbedarf liegt bei 17781 B (check) bzw. 18049 B (install)
-// gegenüber ~22000 B freiem Heap - vorher zu knapp. Erstes Release, von dem ein
-// Gerät auf dem defekten 0.3.0 aus tatsächlich aktualisieren kann.
-#define FIRMWARE_VERSION "0.3.2"
+// 0.4.0: Das Update direkt vom Gerät aus GitHub ist entfernt. Updates laufen nur
+// noch über den Datei-Upload der Weboberfläche (/api/firmware, /api/filesystem)
+// oder per USB (flash.sh). Das Konfigurationsformat ist unverändert
+// (CONFIG_SCHEMA_VERSION bleibt).
+#define FIRMWARE_VERSION "0.4.0"
