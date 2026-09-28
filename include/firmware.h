@@ -20,4 +20,10 @@
 // als nichtssagendes "BearSSL error 0" an, und der Empfangspuffer hing vom Host ab.
 // Siehe Kopfkommentar in firmware_update.cpp. Das Konfigurationsformat ist
 // unverändert (CONFIG_SCHEMA_VERSION bleibt).
-#define FIRMWARE_VERSION "0.3.1"
+//
+// 0.3.2: 0.3.1 wurde nie veröffentlicht (nur auf main). Der check läuft jetzt auf
+// dem echten Gerät über beide github.com-Hops und das CDN durch, das Manifest wird
+// geparst, und der Speicherbedarf liegt bei 17781 B (check) bzw. 18049 B (install)
+// gegenüber ~22000 B freiem Heap - vorher zu knapp. Erstes Release, von dem ein
+// Gerät auf dem defekten 0.3.0 aus tatsächlich aktualisieren kann.
+#define FIRMWARE_VERSION "0.3.2"
