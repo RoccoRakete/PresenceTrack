@@ -4,6 +4,8 @@
 #include "wifi_power.h"
 #include "event_log.h"
 #include "firmware.h"
+#include "sensor_data.h"
+#include "mqtt_ha.h"
 
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecureBearSSL.h>
@@ -15,6 +17,8 @@
 #include <StackThunk.h>
 #include <lwip/dns.h>
 #include <lwip/tcp.h>
+#include <lwip/priv/tcp_priv.h> // struct tcp_seg, nur für sizeof (RESERVE_TLS_TX_REQUEST)
+#include <lwip/prot/ip4.h>
 #include <umm_malloc/umm_malloc.h>
 #include <stdarg.h>
 
@@ -23,10 +27,10 @@
 //
 // Ablauf eines Installs (ein Schritt pro firmwareUpdateLoop()-Takt):
 //   1. Manifest   GET MANIFEST_URL, 2 Redirects (latest -> v<version> -> Asset-CDN),
-//                 Body (~500 B) in den Chunk-Puffer, mit ArduinoJson prüfen
+//                 Body (~650 B) in den Pfad-Puffer, mit ArduinoJson prüfen
 //   2. Firmware   GET firmware.url, Redirect aufs CDN, dort in Range-Requests à
-//                 RANGE_LEN über eine Keep-Alive-Verbindung (siehe Speicher), Body in
-//                 1460-B-Chunks direkt in Update.write(); SHA-256 läuft mit,
+//                 RANGE_LEN über eine Keep-Alive-Verbindung (siehe Speicher), Body ohne
+//                 Kopie aus dem TLS-Empfangspuffer in Update.write(); SHA-256 läuft mit,
 //                 Update.end() erst nach dem Vergleich
 //   3. Image      (nur "both") dasselbe für littlefs.bin mit U_FS
 //   4. Neustart   webServerScheduleReboot(), eboot kopiert die Firmware beim Booten
@@ -38,6 +42,7 @@
 //   Tcp      TCP-Aufbau zur aufgelösten IP (stepTcp)
 //   Tls      Handshake mit SNI (stepTls), danach der Request
 //   Headers  Antwortkopf, Body: Nutzdaten
+//   Request  nächste Range auf derselben Verbindung (Keep-Alive, stepRequest)
 // So lässt sich jeder Fehler seiner Phase zuordnen - siehe Diagnose.
 //
 // Warum ein eigener HTTP-Client statt ESP8266HTTPClient: dessen Redirect-Support
@@ -61,41 +66,80 @@
 //
 // Nur HTTPS: ein Redirect auf http:// wird abgelehnt, es gibt keinen Fallback.
 //
-// Speicher (gemessen ~26 kB freier Heap im Leerlauf, ~14 kB bei 4 parallelen
-// HTTP-Verbindungen; geteilt mit MQTT, Sensoren und Webserver):
-//   RunContext   3264 B (sizeof im Build), nur während eines Laufs (calloc/free)
-//   TLS          pro Verbindung 17246 B, dazu 6752 B Reserve (tlsSocketBytes/-SessionBytes,
-//                TLS_HEAP_RESERVE): vor jedem Aufbau müssen 23998 B frei sein. Bei ~26 kB
-//                im Leerlauf minus RunContext ist das knapp; reicht es nicht, endet der
-//                Lauf mit allen Zahlen, bevor etwas belegt ist (tlsHeapAvailable). Ein
-//                Empfangspuffer für alle Hosts: setBufferSizes(TLS_RX = 4608, 512).
-//                Belegt am Core 3.1.2 (BearSSL-Quellen unter tools/sdk/ssl/bearssl/src):
-//                - Komplett in den Puffer muss nur ein VERSCHLÜSSELTER Record
-//                  (ssl/ssl_engine.c:679-696: BR_ERR_TOO_LARGE nur bei incrypt,
-//                  unverschlüsselte Records bis 16384 B stückweise). Der Handshake bis
-//                  ChangeCipherSpec, also auch die Zertifikatskette (am CDN 4145 B),
-//                  braucht deshalb keinen großen Puffer - wohl aber jede Antwort danach.
-//                - Die Max-Fragment-Length-Extension (MFLN) fordert BearSSL von sich
-//                  aus an, der Core ruft dafür nichts auf: br_ssl_engine_set_buffers_bidi()
-//                  wählt die größte Zweierpotenz, die in Empfangs- UND Sendepuffer
-//                  passt (ssl/ssl_engine.c:429-447), mit 512 + 85 B Sendepuffer immer
-//                  512, und der ClientHello bittet um 512-B-Records
-//                  (ssl/ssl_hs_client.t0:380, 516-519) - unabhängig von TLS_RX.
-//                - Ob der Server sich daran hält, entscheidet er. Gemessen am
-//                  2026-09-27 (openssl s_client -maxfraglen 512 / -msg): github.com
-//                  ja, das Asset-CDN release-assets.githubusercontent.com (Fastly)
-//                  nein - dort kommen Records bis Range-Länge + 16 B (RANGE_LEN).
-//                Bis 0.3.0 bekam github.com nur 512 B und erst nach einem Fehlschlag
-//                mit getLastSSLError() > 0 den großen Puffer. Gespart hat das nichts:
-//                die Heap-Spitze eines Laufs setzt der CDN-Hop, den jeder Lauf braucht
-//                (auch manifest.json liegt dort). Und der Rückfall prüfte die falsche
-//                Stelle: ein zu großer Record kommt erst NACH dem Handshake, beim
-//                Lesen der Antwort, und daran scheiterte der Lauf ohne zweiten Versuch.
-//                Ein Wert für alle Hosts hält, auch wenn github.com MFLN einmal nicht
-//                mehr einhält, solange kein Record größer als 4608 B ist; sonst meldet
-//                der Lauf BearSSL-Fehler 6 (BR_ERR_TOO_LARGE) mit Text.
-//   Images       nie am Stück im RAM: max. ein Chunk (1460 B) hier, max. ein
-//                Flash-Sektor (4 kB) im Updater.
+// Speicher (gemessen am Gerät 10.7.2.152 mit 0.3.1-Vorversion: im Betrieb 19936-22648 B
+// frei, zur Heap-Prüfung im schlechtesten Fall 19024 B, größter Block 13328 B - RunContext
+// (damals 3264 B) und MQTT-Puffer (1024 B) schon abgezogen; geteilt mit MQTT, Sensoren
+// und Webserver):
+//   RunContext   1840 B (sizeof im Build), nur während eines Laufs (calloc/free). Ohne den
+//                Chunk-Puffer (1460 B): der Body wird direkt aus dem TLS-Empfangspuffer
+//                gelesen (peekBuffer), das Manifest landet im Pfad-Puffer, der Request wird
+//                auf dem Stack gebaut (sendRequest).
+//   MQTT         während eines Laufs schrumpft der PubSubClient-Puffer von 1024 auf 256 B
+//                (mqtt_ha.cpp, MQTT_RUN_BUFFER_LEN): +768 B frei, bevor die erste Verbindung
+//                geprüft wird. Zusammen mit dem RunContext stehen in derselben Lage also
+//                1424 + 768 = 2192 B mehr zur Verfügung als bei der Messung oben (umm-Blöcke:
+//                3272 -> 1848 B bzw. 1032 -> 264 B).
+//   TLS          pro Verbindung, Empfangspuffer TLS_RX 1024 B für jeden Fetch:
+//                  check/Manifest  Verbindung 13662 B + Reserve 4119 B            = 17781 B
+//                  Asset-Download  Verbindung 13662 B + Flash-Puffer 268 B
+//                                  + Reserve 4119 B                               = 18049 B
+//                Verbindung und Reserve: tlsNeedBytes(), die Reserve getrennt für
+//                Handshake, Request und Transfer, denn die Verbraucher sind nicht alle
+//                zugleich da. Geprüft vor jedem Aufbau (tlsHeapAvailable); reicht es nach
+//                HEAP_WAIT_MS noch nicht, endet der Lauf mit allen Zahlen, bevor etwas belegt
+//                ist. Erwarteter Tiefstwert bei 19024 + 2192 = 21216 B zur Prüfung, wenn alle
+//                Verbraucher zugleich ihr Maximum brauchen: 3435 B (check) bzw. 3167 B (Asset).
+//                Bis zur 0.3.1-Vorversion: Empfangspuffer 1536/2048 B, eine Reserve von
+//                6674 B für jeden Zeitpunkt ohne das TLS-Senden, bis zu zwei Webverbindungen
+//                und ungedrosseltes MQTT - Bedarf 20848/21628 B, und im check fiel der Heap am
+//                Gerät trotzdem auf 800 B (min_free_heap).
+//   Webserver    pausiert, solange eine Verbindung aufgebaut wird oder ihr Request unterwegs
+//                ist (waitWebIdle, firmwareUpdateHttpConnections), sonst eine Verbindung.
+//   Images       nie am Stück im RAM: max. ein TLS-Record (1024 B) im Empfangspuffer, 256 B
+//                im Updater (beginUpdater: ohne Eingriff nähme er hier 4 kB, siehe dort).
+//
+// Empfangspuffer, belegt am Core 3.1.2 (BearSSL-Quellen unter tools/sdk/ssl/bearssl/src):
+//   - Komplett in den Puffer muss nur ein VERSCHLÜSSELTER Record (ssl/ssl_engine.c:679-696:
+//     BR_ERR_TOO_LARGE nur bei incrypt, wenn Länge > Puffer - 5; unverschlüsselte Records
+//     bis 16384 B stückweise). Der Handshake bis ChangeCipherSpec, also auch die
+//     Zertifikatskette (am CDN 4145 B), braucht deshalb keinen großen Puffer - wohl aber
+//     jede Antwort danach. setBufferSizes() rechnet 325 B für Kopf, IV, MAC und Padding
+//     drauf (WiFiClientSecureBearSSL.cpp:180-190), TLS_RX ist also reiner Klartext.
+//   - Die Max-Fragment-Length-Extension (MFLN) fordert BearSSL von sich aus an:
+//     br_ssl_engine_set_buffers_bidi() wählt die größte Zweierpotenz, die in Empfangs- UND
+//     Sendepuffer passt (ssl/ssl_engine.c:422-447), mit 512 + 85 B Sendepuffer immer 512,
+//     und der ClientHello bittet um 512-B-Records (ssl/ssl_hs_client.t0:380, 516-519) -
+//     unabhängig von TLS_RX.
+//   - Ob der Server sich daran hält, entscheidet er: github.com ja, das CDN
+//     release-assets.githubusercontent.com (Fastly) nein (gemessen 2026-09-27). Auch der
+//     check landet dort: manifest.json liegt wie die Images auf dem CDN (3. Hop, siehe
+//     MANIFEST_URL). Gemessen am 2026-09-28 mit openssl s_client -tls1_2 -maxfraglen 512
+//     -msg (AES-128-GCM, Record auf der Leitung = Klartext + 24 B):
+//       manifest.json (653 B)  Header-Record 873 B, Body-Record 653 B (3 Läufe, gleich)
+//       Range 2048 B, 260x     Header-Record 948-957 B, Body-Record genau 2048 B
+//                              (die ersten Ranges in 1371 + 677 B)
+//       Range 4096 B, 40x      Header-Record 953-955 B, Body-Record genau 4096 B
+//     Kopf und Body kamen nie im selben Record.
+// Der Puffer steht also fest, BEVOR die Verbindung aufgebaut wird, und zwar nach dem, was
+// sie holen soll (tlsRxFor). 1024 B fassen den größten gemessenen Record (Header 957 B), das
+// Manifest und mit RANGE_LEN = 1024 den Body jeder Range. Bis 0.3.0 kam der große Puffer
+// erst als Rückfall nach einem gescheiterten Handshake - an der falschen Stelle, denn ein
+// zu großer Record kommt erst NACH dem Handshake, beim Lesen der Antwort, und daran
+// scheiterte der Lauf ohne zweiten Versuch. Ist ein Record doch einmal größer, meldet der
+// Lauf BearSSL-Fehler 6 (BR_ERR_TOO_LARGE) mit Text; kein Absturz, nichts geflasht.
+//
+// Nicht zu verkleinern, belegt am Core 3.1.2:
+//   - StackThunk 6200 B, der größte Posten: fest im Core (StackThunk.cpp:45), malloc() für
+//     den ersten BearSSL-Client (Zeile 59). Jede TLS-Verbindung braucht ihn, auch eine kurze
+//     fürs Manifest, und github.com wie das CDN liefern nur über HTTPS (ein Klartext-Umweg
+//     schiede auch an "Nur HTTPS" oben). Statisch vorgehalten fehlte er dauerhaft statt nur
+//     im Lauf. Er muss am Stück frei sein; der größte Block (13328 B im schlechtesten
+//     gemessenen Moment) reicht dafür.
+//   - X.509-Kontext von setInsecure() 1480 B, nur im Handshake: den Validator wählt die
+//     private _installClientX509Validator() (WiFiClientSecureBearSSL.h:234, .cpp:1056-1058);
+//     setFingerprint() nutzt denselben Kontext, setKnownKey() pinnte den Serverschlüssel und
+//     bräche beim nächsten Zertifikatswechsel. Er zählt deshalb nur im Handshake (tlsNeedBytes).
+//   - br_ssl_client_context 3408 B und der Sendepuffer 512 + 85 B (Minimum, setBufferSizes).
 //
 // Blockieren: der Automat läuft aus webServerLoop(), also in loop() - nicht im
 // lwIP-Kontext der Request-Handler, die nur einen Lauf anstoßen. Pro Verbindung:
@@ -109,13 +153,16 @@
 //            ECDHE auf 80 MHz, typisch 1-2 s, auf diesem Gerät nicht gemessen
 //            (Serial zeigt die Dauer, siehe Diagnose).
 // Dabei laufen esp_delay() bzw. optimistic_yield() (_run_until), der Watchdog wird
-// bedient und der AsyncWebServer beantwortet /api/update/status weiter; nur
-// sensorsLoop() und mqttHaLoop() pausieren, im schlimmsten Fall 10 + 15 s am Stück -
-// unter dem MQTT-Keepalive von 60 s (der Broker trennt erst nach 1,5 x Keepalive).
+// bedient und lwIP arbeitet weiter; sensorsLoop() und mqttHaLoop() pausieren, im
+// schlimmsten Fall 10 + 15 s am Stück - unter dem MQTT-Keepalive von 60 s (der Broker
+// trennt erst nach 1,5 x Keepalive). Neue HTTP-Verbindungen nimmt der Webserver in dieser
+// Zeit nicht an (Webserver-Pause, siehe waitWebIdle): lwIP verwirft das SYN, der Browser
+// wiederholt es nach ~1 s, 3 s, 7 s, und der Status-Poll kommt danach durch.
 // BearSSL selbst rechnet auf dem eigenen 6200-B-Stack des StackThunk
 // (make_stack_thunk, BearSSLHelpers.cpp:977ff.), nicht auf dem 4-kB-Stack von loop().
-// Alles andere ist nicht-blockierend: read() liefert nur, was schon da ist,
-// höchstens TICK_BUDGET_MS pro Takt.
+// Alles andere ist nicht-blockierend: available()/peekBuffer() liefern nur, was schon
+// da ist, höchstens TICK_BUDGET_MS pro Takt. Nur sendRequest() wartet, bis lwIP den
+// Request angenommen hat (TCP_SND_BUF, siehe TlsClient::writeNoAckWait).
 //
 // Diagnose: getLastSSLError() allein unterscheidet die Fälle nicht. Es liefert 0,
 // solange der Core keinen BearSSL-Kontext hat (_sc entsteht erst in _connectSSL(),
@@ -136,9 +183,6 @@ static const char MANIFEST_URL[] PROGMEM = "https://github.com/RoccoRakete/Prese
 
 // latest -> v<version> -> CDN sind 2 Hops, 3 lassen einen Zwischenschritt Luft.
 static const uint8_t MAX_REDIRECTS = 3;
-// Größe von Update.write()-Stücken und Lesepuffer; dieselbe Stückelung wie beim
-// Datei-Upload (AsyncWebServer liefert max. 1460 B, eine TCP-MSS).
-static const size_t CHUNK_LEN = 1460;
 // Location des CDN-Redirects gemessen am 2026-09-27: 930 Zeichen, davon 892
 // Pfad + signierte Query (sp/sv/se/sig/jwt). Reserve für längere Tokens.
 static const size_t URL_PATH_MAX_LEN = 1152;
@@ -147,14 +191,28 @@ static const size_t HOST_MAX_LEN = 48;
 // firmware.url/filesystem.url laut Vertrag ".../releases/download/v0.3.0/littlefs.bin", ~85 Zeichen
 static const size_t ASSET_URL_MAX_LEN = 128;
 static const size_t SHA256_LEN = 32;
-// Range-Größe für Assets. Gemessen am 2026-09-27 mit 40 Ranges hintereinander
-// auf einer Keep-Alive-Verbindung: die Antwort-Header kommen immer in einem
-// eigenen Record (~946 B), der Body anfangs in Records <= 1395 B, nach einigen
-// zehn kB aber am Stück - Range-Länge + 16 B (4096 -> 4112, 8192 -> 8208). Der
-// Body einer Range muss also in den Empfangspuffer (TLS_RX = 4608 B
-// Klartext) passen; 8 kB scheiterten im Test nach 56 kB. 1 MB littlefs.bin =
-// 250 Requests auf einer Verbindung, je ein RTT (~30 ms) extra.
-static const uint32_t RANGE_LEN = 4096;
+// Range-Größe für Assets. Der CDN schickt den Body einer Range als einen Record mit
+// genau RANGE_LEN B Klartext (Messung im Kopfkommentar), der muss in den Empfangspuffer:
+// TLS_RX_ASSET = RANGE_LEN, und der Puffer ist der einzige Posten der Verbindung, der
+// mit der Range wächst. Abwägung für "both", littlefs.bin (1024000 B) + firmware.bin
+// (607072 B in v0.3.0); ein Request ist ~1080 B (signierte URL 892 Zeichen + ~190 B Kopf),
+// also drei Records à TLS_TX:
+//   RANGE_LEN  Requests           Bedarf Asset  RTT gesamt (2 je Range)
+//   2048        297 + 500 =  797     19073 B    1594
+//   1536        396 + 667 = 1063     18561 B    2126
+//   1024        593 + 1000 = 1593    18049 B    3186
+// 2 RTT je Range: die drei Records gehen ohne Warten hinaus (TlsClient::writeNoAckWait),
+// nur die ~1170 B auf der Leitung übersteigen TCP_SND_BUF (1072 B) und warten auf ein ACK,
+// dazu die Antwort. Bis zur 0.3.1-Vorversion wartete der Core nach jedem Record aufs ACK
+// (WiFiClientSecureBearSSL.cpp:326 flush() -> WiFiClient.cpp:313 wait_until_acked(),
+// ClientContext.h:316-360): 3 RTT, mit 2048 also 2391 RTT. RTT am PC gemessen (2026-09-28,
+// curl time_connect): CDN 7 ms, github.com 11 ms; am Gerät nicht gemessen. Bei angenommenen
+// 15 ms reine Wartezeit: 1024 ~48 s, 1536 ~32 s, 2048 ~24 s, Vorversion ~36 s; dazu je
+// Range ein Header-Record von ~980 B (1593 x = 1,6 MB statt 0,8 MB bei 2048).
+// 2048 passt nicht (19073 > 19000 B), 1536 ließe nur 2655 B als Tiefstwert (Kopfkommentar,
+// Speicher: 21216 - 18561), knapp über den 2500 B. 1024 lässt 3167 B und kostet gegenüber
+// der Vorversion geschätzt ~12 s.
+static const uint32_t RANGE_LEN = 1024;
 
 // Taktbudget: danach kommen sensorsLoop()/mqttHaLoop() wieder dran. Ein
 // Flash-Sektor (Erase + Write) kostet ~30-50 ms, das Budget lässt also etwa
@@ -175,11 +233,20 @@ static const unsigned long DNS_TIMEOUT_MS = 10000;
 // seinem RTO, laut lwIP-Doku anfangs 3 s; im Core liegt lwIP nur binär vor).
 static const unsigned long TCP_CONNECT_TIMEOUT_MS = 10000;
 
-// TLS-Puffer, für alle Hosts gleich (Begründung im Kopfkommentar, Speicher). 4608 B
-// Klartext fassen den Body einer Range (RANGE_LEN 4096 B + 16 B, ein Record) mit
-// 496 B Luft. Die Overheads stammen aus WiFiClientSecureCtx::setBufferSizes()
+// TLS-Empfangspuffer (Klartext) je Fetch, gewählt vor dem Aufbau (tlsRxFor; Messung und
+// Begründung im Kopfkommentar). Manifest: der größte Record ist der Header-Record des CDN
+// (873 B); das Manifest selbst (653 B) kommt als ein Record, parseManifest nimmt deshalb
+// höchstens TLS_RX_MANIFEST B an (MANIFEST_MAX_LEN). Assets: genau der Body-Record einer
+// Range. Die Header-Records (<= 957 B, 67 B Luft) und die 302 von github.com (MFLN, 512 B)
+// passen in beide. Die Overheads stammen aus WiFiClientSecureCtx::setBufferSizes()
 // (WiFiClientSecureBearSSL.cpp:180-188, dort aus ssl_engine.c:282-283 übernommen).
-static const int TLS_RX = 4608;
+static const int TLS_RX_MANIFEST = 1024;
+static const int TLS_RX_ASSET = RANGE_LEN;
+static const uint32_t CDN_HEADER_RECORD_MAX = 957; // gemessen, siehe Kopfkommentar
+static const size_t MANIFEST_MAX_LEN = TLS_RX_MANIFEST;
+static_assert(TLS_RX_MANIFEST >= (int)CDN_HEADER_RECORD_MAX && TLS_RX_ASSET >= (int)CDN_HEADER_RECORD_MAX,
+              "Empfangspuffer fassen die gemessenen Records nicht mehr");
+static_assert(MANIFEST_MAX_LEN <= URL_PATH_MAX_LEN, "das Manifest wird im Pfad-Puffer gelesen (stepBody)");
 static const int TLS_TX = 512; // Minimum des Cores (setBufferSizes klemmt auf >= 512)
 static const uint32_t TLS_IN_OVERHEAD = 325;
 static const uint32_t TLS_OUT_OVERHEAD = 85;
@@ -201,31 +268,120 @@ static const uint32_t TLS_SHARED_DELETER_BYTES = 16;
 // ohne DEBUG_ESP_PORT, umm_malloc_cfg.h:600-606).
 static const uint32_t UMM_ALLOC_SLACK = 12;
 
-// Muss nach dem TLS-Aufbau frei bleiben, geprüft vor dem Aufbau (mit dem Bedarf der
-// Verbindung) und danach. Was während einer offenen Verbindung noch Heap braucht:
-//   2 x 2048 B  Webserver: während eines Laufs nimmt er nur FW_UPDATE_HTTP_CONNECTIONS
-//               = 2 Verbindungen an (Status-Poll, Abbruch), je pcb, AsyncClient,
-//               Request, Header und FixedJsonResponse (~2 kB, wie RESPONSE_HEAP_RESERVE
-//               = 6144 in web_server.cpp für 3 Verbindungen)
-//   TCP_WND     Empfangsfenster der TLS-Verbindung, 4 x TCP_MSS 536 = 2144 B
-//               (lwipopts.h:1251, TCP_MSS aus platformio-build.py, Variante
-//               LWIP2_LOW_MEMORY): so viel puffert lwIP, bis read() es abholt, z.B.
-//               während eines Flash-Erase
-//   512 B       pbuf-Köpfe dieser Segmente und die Sende-pbufs der MQTT-Publishes
-//               (Topic/Payload liegen in statischen Puffern)
-// Nicht abgedeckt: ein MQTT-Reconnect mitten im Lauf schickt die Discovery erneut
-// (JsonDocument + String, einige hundert B pro Entität) - dort scheitert eine
-// Allokation aber mit Fehlerwert statt Panic (ArduinoJson/String/tcp_write).
-// Panicen würden dagegen die normalen `new` im Core und in ESPAsyncWebServer; genau
-// dafür ist die Reserve da.
-static const uint32_t TLS_HEAP_RESERVE = FW_UPDATE_HTTP_CONNECTIONS * 2048 + TCP_WND + 512;
+// Updater::begin() nimmt einen 4096-B-Sektorpuffer nur, wenn mehr als 2 x FLASH_SECTOR_SIZE
+// frei sind, sonst 256 B (Updater.cpp:172-177, nothrow); beginUpdater() sorgt für die 256 B,
+// wenn 4096 die Reserve verletzen würden. Gezählt für einen Asset-Fetch, bis begin() lief.
+static const uint32_t UPDATER_SMALL_BUFFER = 256;
+static const uint32_t UPDATER_BUFFER_BYTES = UPDATER_SMALL_BUFFER + UMM_ALLOC_SLACK;
+
+// Reserve: was neben einer offenen Verbindung zusätzlich Heap belegen kann. Die Verbraucher
+// kommen nicht alle zugleich, deshalb drei Zeitpunkte je Verbindung, in der Reihenfolge des
+// Codes (stepTcp -> stepTls -> sendRequest -> stepHeaders/stepBody -> beginFlash):
+//   Handshake  _connectSSL(): der X.509-Kontext ist belegt, der Client sendet seine Flights;
+//              der Webserver ist pausiert (waitWebIdle vor dem TCP-Aufbau)
+//   Request    X.509 wieder frei (_x509_insecure = nullptr, WiFiClientSecureBearSSL.cpp:1206),
+//              der Request geht hinaus; Webserver pausiert, bis lwIP ihn bestätigt hat (webMayRun)
+//   Transfer   Antwort und Body; der Webserver bedient eine Verbindung, beim ersten Request
+//              eines Assets kommt mit dem ersten Record der Flash-Puffer dazu (beginFlash)
+// Innerhalb eines Zeitpunkts zählen alle seine Verbraucher gleichzeitig: zwischen zwei Takten
+// liest der Automat nicht, die Antwort läuft in lwIP auf, mqttHaLoop publiziert, und der
+// Webserver beantwortet einen Poll.
+// lwIP-Zahlen: lwipopts.h, Variante lwip2-536-feat (TCP_MSS 536, IPv4, lwIP 2.1.3), jede
+// Allokation im umm-Heap (MEMP_MEM_MALLOC, lwipopts.h:279).
+//   TLS-Empfang   2472 B  in allen drei: lwIP puffert bis TCP_WND = 4 x 536 B (lwipopts.h:1251),
+//                         bis BearSSL abholt: die Antwort einer Range (~2,0 kB auf der Leitung),
+//                         die 302 von github.com (~5 kB, 3,7 kB davon CSP-Header), die
+//                         Zertifikate im Handshake. Je Segment ein pbuf für den ganzen Frame
+//                         (esp2glue_alloc_for_recv, glue.h:103): 16 + 14 + 20 + 20 + 536 + 12.
+//   TLS-Senden    1035 B  Handshake: ein Client-Flight, ClientHello (ein Record <= 512 + 85 B,
+//                         zwei Segmente) bzw. ClientKeyExchange + ChangeCipherSpec + Finished
+//                         (drei Records, ~130 B mit ECDHE); den nächsten Flight schickt BearSSL
+//                         erst auf die Antwort des Servers, die den vorigen bestätigt: 597 + 3 x 146.
+//                 1510 B  Request: lwIP hält höchstens TCP_SND_BUF = 1072 B (lwipopts.h:1326)
+//                         unbestätigt, mit TCP_NODELAY (stepTcp) in genau passenden Segmenten,
+//                         höchstens drei: 1072 + 3 x 146. Ohne NODELAY legt lwIP ab dem zweiten
+//                         unbestätigten Segment MSS-große pbufs an (TCP_OVERSIZE = TCP_MSS,
+//                         lwipopts.h:1432; tcp_pbuf_prealloc() in lwIP 2.1.3): bis 3 x 682 B.
+//                         Bis zur 0.3.1-Vorversion fehlte dieser Posten ganz.
+//   MQTT           463 B  in allen drei. Während eines Laufs (mqtt_ha.cpp) höchstens ein PUBLISH
+//                         (<= MQTT_STATE_PACKET_MAX = 85 B) und ein PINGREQ (2 B) unbestätigt,
+//                         beide mit TCP_NODELAY in genau passenden Segmenten, dazu das PINGRESP
+//                         (ein Frame, 82 + 2 B), bis PubSubClient::loop() es liest:
+//                         146 + 85 + 146 + 2 + 84. Ohne Drosselung schickt publishStates() alle
+//                         2 s bis zu 16 Nachrichten, mit Nagle + TCP_OVERSIZE bis 3 x 682 = 2046 B
+//                         (die Vorversion rechnete 1510 B).
+//   Webserver     2692 B  nur im Transfer, eine Verbindung (FW_UPDATE_HTTP_CONNECTIONS; der
+//                         wartende install-Request zählt nicht, sein Heap ist bei der Prüfung
+//                         schon belegt): ein Status-Poll, die UI fragt während eines Laufs nur
+//                         /api/update/status ab, alle GH_POLL_MS = 1000 ms (data/app.js).
+//                         tcp_pcb 184 + AsyncClient 220 + AsyncWebServerRequest 324 +
+//                         FixedJsonResponse 616 (sizeof im Build) + 4 x 12, der Request als
+//                         ein RX-Segment (618) und die Antwort (<= 95 B Kopf + 416 B) als
+//                         ein TX-Segment (682). Die Request-Header (~7 à ~60 B) sind vor der
+//                         Antwort wieder frei und kleiner als Response + TX-Segment.
+//   Sensoren         0 B  sensorsLoop() arbeitet nur auf statischen Puffern.
+// Damit neben der Verbindung: Handshake 3970 B, Request 4445 B, Transfer 5627 B. Der
+// X.509-Kontext (1508 B) ist nur im Handshake belegt, deshalb bindet der Transfer
+// (tlsNeedBytes): 5627 - 1508 = 4119 B Reserve über der Verbindung, beim Asset + 268 B.
+// Unterhalb der Reserve wird es nicht sofort kritisch: pbufs, AsyncClient, Request- und
+// Response-Objekte scheitern mit Fehlerwert (Paket verworfen, Verbindung geschlossen, TCP
+// wiederholt). Einen Neustart (OOM-Panic) lösen nur `new` ohne nothrow aus: beim
+// Header-Parsen je AsyncWebHeader 24 B + Listenknoten (WebRequest.cpp:348), beim
+// MQTT-Reconnect der ClientContext 52 B, im Handshake die Objekte des Cores.
+// Nicht abgedeckt, nur durch den Abstand zum Tiefstwert (Kopfkommentar, Speicher): ein
+// MQTT-Reconnect mitten im Lauf (~0,7 kB: tcp_pcb 184 + ClientContext 52 + CONNECT <= 205 B
+// in einem Segment + CONNACK; Discovery wartet bis nach dem Lauf), statt des Polls der
+// Abbruch-POST (JSON-Body und zwei JsonDocuments, einige hundert Byte mehr), ein Neuladen der
+// Seite während eines Laufs (Dateien aus LittleFS, mehr als ein Poll) und was das WLAN-SDK
+// selbst braucht (nicht messbar, nur der Tiefstwert).
+// Gegen die Messung: 0.3.0 fiel im Lauf auf min_free_heap 4712 B und lief weiter, die
+// 0.3.1-Vorversion im check auf 800 B. Beides ist mit den fehlenden Posten vereinbar (in der
+// Vorversion nach dem Aufbau 6674 B eingeplant, möglich waren TLS-Empfang 2472 + TLS-Senden
+// bis 2046 + MQTT bis 2046 + zwei Webverbindungen 5384 B), welcher davon die 800 B verursachte,
+// ist nicht einzeln belegt.
+static const uint32_t RX_FRAME_OVERHEAD = sizeof(pbuf) + PBUF_LINK_HLEN + IP_HLEN + TCP_HLEN + UMM_ALLOC_SLACK;
+static const uint32_t RX_SEGMENT_BYTES = RX_FRAME_OVERHEAD + TCP_MSS;
+static const uint32_t TX_SEGMENT_OVERHEAD = sizeof(pbuf) + PBUF_LINK_ENCAPSULATION_HLEN + PBUF_LINK_HLEN +
+                                            PBUF_IP_HLEN + PBUF_TRANSPORT_HLEN + UMM_ALLOC_SLACK +
+                                            sizeof(tcp_seg) + UMM_ALLOC_SLACK;
+// sizeof im Build (Core 3.1.2, ESPAsyncTCP-esphome 2.0, ESPAsyncWebServer-esphome 3.2):
+// dieses Modul kennt die Webserver-Typen bewusst nicht (firmware_update.h)
+static const uint32_t WEB_ASYNC_CLIENT_BYTES = 220;
+static const uint32_t WEB_REQUEST_BYTES = 324;
+static const uint32_t WEB_STATUS_RESPONSE_BYTES = 616; // FixedJsonResponse, web_server.cpp
+static const uint32_t MQTT_PINGREQ_LEN = 2;
+static const uint32_t MQTT_PINGRESP_LEN = 2;
+static const uint32_t RESERVE_TLS_RX = TCP_WND / TCP_MSS * RX_SEGMENT_BYTES;
+static const uint32_t RESERVE_TLS_TX_HANDSHAKE = TLS_TX + TLS_OUT_OVERHEAD + 3 * TX_SEGMENT_OVERHEAD;
+static const uint32_t RESERVE_TLS_TX_REQUEST = TCP_SND_BUF + (TCP_SND_BUF / TCP_MSS + 1) * TX_SEGMENT_OVERHEAD;
+static const uint32_t RESERVE_MQTT = TX_SEGMENT_OVERHEAD + MQTT_STATE_PACKET_MAX + TX_SEGMENT_OVERHEAD +
+                                     MQTT_PINGREQ_LEN + RX_FRAME_OVERHEAD + MQTT_PINGRESP_LEN;
+static const uint32_t RESERVE_WEB = sizeof(tcp_pcb) + WEB_ASYNC_CLIENT_BYTES + WEB_REQUEST_BYTES +
+                                    WEB_STATUS_RESPONSE_BYTES + 4 * UMM_ALLOC_SLACK + RX_SEGMENT_BYTES +
+                                    TX_SEGMENT_OVERHEAD + TCP_MSS;
+static const uint32_t RESERVE_HANDSHAKE = RESERVE_TLS_RX + RESERVE_TLS_TX_HANDSHAKE + RESERVE_MQTT;
+static const uint32_t RESERVE_REQUEST = RESERVE_TLS_RX + RESERVE_TLS_TX_REQUEST + RESERVE_MQTT;
+static const uint32_t RESERVE_TRANSFER = RESERVE_TLS_RX + RESERVE_MQTT + RESERVE_WEB;
+// Direkt nach dem Handshake können TLS-Empfang und MQTT ihren Teil schon belegen (dann ist er
+// bereits abgezogen); dazukommen können noch der Request bzw. danach ein Poll und beim ersten
+// Asset-Request der Flash-Puffer. Nach Update.begin() (im Transfer) kann der Poll schon
+// laufen. Beide Prüfungen fangen nur grobe Fehlschätzungen ab; die volle Rechnung hat die
+// Prüfung vor dem Aufbau verlangt.
+static const uint32_t TLS_HEAP_RESERVE_AFTER = std::max(RESERVE_TLS_TX_REQUEST, RESERVE_WEB);
+static const uint32_t UPDATER_HEAP_RESERVE_AFTER = RESERVE_TRANSFER - RESERVE_WEB;
+
+// Reicht der Heap vor einem Aufbau nicht, wartet der Automat bis zu so lange, bevor er
+// ablehnt: zur Prüfzeit ist der Webserver schon still (waitWebIdle), aber MQTT kann gerade
+// ein Segment unterwegs haben, und die Verbindung des vorigen Hops ist eben erst zu
+// (closeClient). 3 s kosten nichts: nichts ist belegt, blockiert wird nicht.
+static const unsigned long HEAP_WAIT_MS = 3000;
 
 // Nachbau von br_x509_insecure_context (privat, WiFiClientSecureBearSSL.cpp:671-680)
 // nur für sizeof: setInsecure() legt ihn pro Handshake mit make_shared an
 // (_installClientX509Validator, Zeile 1058). Die Feldtypen kommen aus den
 // BearSSL-Headern, der Nachbau wächst also mit ihnen. Nach dem Handshake gibt der Core
-// ihn wieder frei (_x509_insecure = nullptr, Zeile 1206); gezählt wird er trotzdem,
-// denn während des Handshakes antwortet der Webserver weiter.
+// ihn wieder frei (_x509_insecure = nullptr, Zeile 1206); gezählt wird er deshalb nur
+// im Handshake (tlsNeedBytes).
 struct X509InsecureSizeMirror {
     const br_x509_class *vtable;
     bool done_cert;
@@ -246,14 +402,63 @@ struct X509InsecureSizeMirror {
 // setTimeout() den TCP-Aufbau, und das spart dessen shared_ptr.
 class TlsClient : public BearSSL::WiFiClientSecureCtx {
   public:
+    using BearSSL::WiFiClientSecureCtx::flush;
+
     bool connectTcp(const IPAddress &ip, uint16_t port) { return WiFiClient::connect(ip, port); }
     bool handshake(const char *host) { return _connectSSL(host); }
     bool tcpEstablished() { return WiFiClient::status() == ESTABLISHED; }
+
+    // lwIP hat alles Gesendete bestätigt bekommen, die TX-Segmente sind frei (tcp_sndbuf,
+    // ClientContext.h:161-164). Auf einer geschlossenen Verbindung ist nichts mehr belegt.
+    bool tcpAcked() { return !tcpEstablished() || WiFiClient::availableForWrite() == TCP_SND_BUF; }
+
+    // read() ohne Kopie: zeigt auf den entschlüsselten Rest des aktuellen Records im
+    // Empfangspuffer (available() -> _pollRecvBuffer(), peekBuffer(),
+    // WiFiClientSecureBearSSL.cpp:398-444), gültig bis peekConsume(). >0 Bytes, 0 = noch
+    // nichts da, -1 = Verbindung weg - dieselben Fälle wie read() (Zeile 355-393).
+    int peekRecord(const uint8_t *&data) {
+        const int n = available();
+        if (n > 0) {
+            data = reinterpret_cast<const uint8_t *>(peekBuffer());
+            return n;
+        }
+        return connected() ? 0 : -1;
+    }
+
+    // write(), ohne nach jedem Record aufs ACK zu warten: _write() ruft nach jedem Record
+    // das virtuelle flush() (WiFiClientSecureBearSSL.cpp:326), das bis zu 300 ms auf die
+    // Bestätigung wartet (WiFiClient.cpp:313, ClientContext.h:316-360) - pro Request drei RTT.
+    // Hier schiebt flush() den Record nur an lwIP weiter: availableForWrite() läuft
+    // _run_until(BR_SSL_SENDAPP) (Zeile 276-294) und schreibt dabei, was BearSSL zu senden
+    // hat. Mehr als TCP_SND_BUF unbestätigt lässt lwIP nicht zu; dann wartet
+    // ClientContext::write() wie bisher (_write_from_source), also höchstens
+    // RESERVE_TLS_TX_REQUEST im Heap.
+    size_t writeNoAckWait(const uint8_t *buf, size_t len) {
+        _noAckWait = true;
+        const size_t n = write(buf, len);
+        _noAckWait = false;
+        return n;
+    }
+
+    void flush() override {
+        if (_noAckWait) {
+            (void)BearSSL::WiFiClientSecureCtx::availableForWrite();
+            return;
+        }
+        BearSSL::WiFiClientSecureCtx::flush();
+    }
+
+  private:
+    // Statisch statt Member: es gibt nur einen TlsClient, und sizeof(TlsClient) bleibt 208 B
+    static bool _noAckWait;
 };
+
+bool TlsClient::_noAckWait = false;
 
 enum class Job : uint8_t { Check, Install };
 enum class Fetch : uint8_t { Manifest, Firmware, Filesystem };
-enum class Phase : uint8_t { Resolve, Tcp, Tls, Headers, Body };
+// Request hinten angehängt: die Absturzmarke (RtcMark) speichert die Nummer
+enum class Phase : uint8_t { Resolve, Tcp, Tls, Headers, Body, Request };
 enum class Step : uint8_t { Continue, Failed, Finished };
 enum class HdrState : uint8_t { StatusLine, Name, ValueStart, Value, Done };
 enum class HdrField : uint8_t { Other, Location, ContentLength, ContentRange, TransferEncoding, Connection };
@@ -292,6 +497,13 @@ struct HeaderParser {
 // Alles, was ein Lauf braucht, in einem Block: wird beim Start mit calloc()
 // angelegt und am Ende freigegeben, kostet im Leerlauf also keinen Heap. Nur
 // Plain Data (calloc/free, keine Konstruktoren).
+// Liegt während des ganzen Laufs, also nur, was über Takte hinweg gebraucht wird. Kein
+// Chunk-Puffer mehr (bis zur 0.3.1-Vorversion 1460 B): Header und Body kommen per
+// peekRecord() direkt aus dem TLS-Empfangspuffer, das Manifest in path (nach dem 200 ist der
+// Pfad frei), der Request entsteht auf dem Stack (sendRequest). Geprüft und verworfen, weil
+// es je nur wenige Byte bringt und Felder doppelt belegen würde: hdr und head in einer
+// union (32 B; hdr lebt bis onHeadersDone, head erst danach), firmware.url in path statt
+// im Asset (128 B; der Pfad trägt beim Parsen noch das Manifest).
 struct RunContext {
     TlsClient *client;
     Job job;
@@ -305,21 +517,29 @@ struct RunContext {
     bool firmwareStaged; // Firmware-Update.end() war erfolgreich, eboot kopiert beim nächsten Boot
     bool sleepForced;    // Update.begin() lief: es erzwingt WIFI_NONE_SLEEP (Updater.cpp:112)
     bool dnsPending;     // dns_gethostbyname() wartet auf den Callback (s_dns)
+    bool heapWaiting;    // diese Phase wartet auf Heap (HEAP_WAIT_MS), schon protokolliert
+    bool webHold;        // Webserver pausiert (firmwareUpdateHttpConnections() == 0)
+    bool webWaiting;     // wartet darauf, dass die offenen HTTP-Verbindungen zugehen
     uint16_t port;
     uint32_t ip;         // aufgelöste IPv4-Adresse des Hosts (IPAddress ist kein Plain Data)
-    uint32_t minHeap;    // kleinster freier Heap in diesem Lauf, pro Takt gemessen
+    uint32_t minHeap;    // kleinster freier Heap in diesem Lauf, an den Messpunkten (noteHeap)
     uint32_t nextLogAt;  // Body-Offset der nächsten Fortschrittszeile auf Serial
     unsigned long phaseStartMs;
+    unsigned long heapWaitStartMs;
+    unsigned long webWaitStartMs;
     unsigned long lastDataMs;
     uint32_t received; // verarbeitete Body-Bytes des aktuellen Fetches (= Offset im Asset)
     uint32_t bodyEnd;  // Offset hinter dem Body der aktuellen Antwort (Ende der Range)
-    size_t fill;       // Bytes in chunk, noch nicht verarbeitet
+    size_t fill;       // Manifest: Bytes in path; Asset: Bytes in head vor Update.begin()
     HeaderParser hdr;
     br_sha256_context sha;
     char expectedVersion[FW_VERSION_MAX_LEN];
     char host[HOST_MAX_LEN];
-    char path[URL_PATH_MAX_LEN];   // Pfad + Query des aktuellen Requests, danach Ziel der Location
-    uint8_t chunk[CHUNK_LEN];      // Manifest-Body bzw. aktueller Asset-Chunk
+    char path[URL_PATH_MAX_LEN];   // Pfad + Query des aktuellen Requests, danach Ziel der Location;
+                                   // nach dem 200 fürs Manifest dessen Body (MANIFEST_MAX_LEN)
+    // Anfang eines Assets für die Bildprüfung (beginFlash), die LFS_SUPERBLOCK_MIN_LEN B am
+    // Stück braucht - der erste Record einer Range könnte kürzer sein
+    uint8_t head[LFS_SUPERBLOCK_MIN_LEN];
     Asset firmware;
     Asset filesystem;
 };
@@ -331,9 +551,10 @@ static FwUpdateTarget s_target = FwUpdateTarget::None;
 static char s_version[FW_VERSION_MAX_LEN] = "";
 static uint32_t s_bytesDone = 0;  // über beide Assets eines "both"-Laufs summiert
 static uint32_t s_bytesTotal = 0; // firmware.size (+ filesystem.size)
-// Längste Meldungen ~200 Zeichen: TLS-Fehler mit Host, IP und dem längsten Text aus
-// getLastSSLError(), bzw. der Heap-Fehler mit allen Zahlen; dazu die Hinweise aus failRun().
-static char s_error[240] = "";
+// Längste Meldungen: der Heap-Fehler mit allen Zahlen (bis 226 Zeichen, mit dem CDN-Host)
+// bzw. TLS-Fehler mit Host, IP und dem längsten Text aus getLastSSLError(); dazu die
+// Hinweise aus failRun() (" - filesystem half written, ..." 48 Zeichen beim Reconnect).
+static char s_error[256] = "";
 static FwManifestOutcome s_outcome = FwManifestOutcome::Pending;
 static FwManifestInfo s_manifest = {};
 static bool s_abortRequested = false;
@@ -346,12 +567,14 @@ static const char *stateName(FwUpdateState s);
 static void setState(FwUpdateState state);
 
 // Serial-Protokoll (115200 Baud, main.cpp), Formatstrings wie bei setError im Flash.
-// Nur Phasenwechsel und Ergebnisse, nie pro Chunk: der UART-FIFO hat 128 B, jede
-// Zeile darüber hinaus wartet ~87 us pro Zeichen im Takt.
+// Nur Phasenwechsel und Ergebnisse, nie pro Record: der UART-FIFO hat 128 B, jede
+// Zeile darüber hinaus wartet ~87 us pro Zeichen im Takt. Stumm, sobald UART0 auf
+// den LD2450 getauscht ist (serialLogEnabled()), sonst landete das Protokoll auf dessen RX.
 #define logLine(fmt, ...)                                                   \
     do {                                                                    \
         if (false) snprintf(nullptr, 0, fmt, ##__VA_ARGS__);                \
-        Serial.printf_P(PSTR("[update] " fmt "\n"), ##__VA_ARGS__);         \
+        if (serialLogEnabled())                                             \
+            Serial.printf_P(PSTR("[update] " fmt "\n"), ##__VA_ARGS__);     \
     } while (0)
 
 static const char *phaseName(Phase p) {
@@ -361,6 +584,7 @@ static const char *phaseName(Phase p) {
         case Phase::Tls: return "TLS";
         case Phase::Headers: return "HTTP-Header";
         case Phase::Body: return "Body";
+        case Phase::Request: return "Request";
     }
     return "?";
 }
@@ -412,7 +636,7 @@ static void reportRtcMark() {
     if (m.magic != RTC_MARK_MAGIC || m.check != rtcMarkCheck(m)) return;
     static const char *const FETCH_NAMES[] = {"manifest.json", "firmware.bin", "littlefs.bin"};
     const char *fetch = m.fetch < 3 ? FETCH_NAMES[m.fetch] : "?";
-    const char *phase = m.phase <= (uint8_t)Phase::Body ? phaseName((Phase)m.phase) : "?";
+    const char *phase = m.phase <= (uint8_t)Phase::Request ? phaseName((Phase)m.phase) : "?";
     const String reason = ESP.getResetReason();
     logLine("ABSTURZ im letzten Lauf: %s, %s, Phase %s, Hop %u, Heap beim Eintritt %u B, Reset-Grund: %s",
             m.job == (uint8_t)Job::Check ? "check" : "install", fetch, phase, m.hops, m.freeHeap, reason.c_str());
@@ -425,6 +649,8 @@ static void reportRtcMark() {
 static void enterPhase(RunContext &r, Phase p) {
     r.phase = p;
     r.phaseStartMs = millis();
+    r.heapWaiting = false;
+    r.webWaiting = false;
     writeRtcMark(r);
 }
 
@@ -591,10 +817,36 @@ static bool setUrl(RunContext &r, const char *url) {
     return true;
 }
 
+// Sammelt den Request auf dem Stack in Stücken zu TLS_TX B: jeder write() wird beim Core
+// mindestens ein eigener TLS-Record (WiFiClientSecureBearSSL.cpp:315-329), volle Stücke
+// ergeben also genau so viele Records wie ein Request am Stück (~1080 B: drei).
+struct RequestWriter {
+    TlsClient *client;
+    size_t len;
+    bool ok;
+    uint8_t buf[TLS_TX];
+
+    void add(const char *s, size_t n) {
+        while (ok && n) {
+            const size_t take = std::min(n, sizeof(buf) - len);
+            memcpy(buf + len, s, take);
+            len += take;
+            s += take;
+            n -= take;
+            if (len == sizeof(buf)) send();
+        }
+    }
+
+    void send() {
+        if (ok && len) ok = client->writeNoAckWait(buf, len) == len;
+        len = 0;
+    }
+};
+
 static bool sendRequest(RunContext &r) {
-    // In einem Stück in den (gerade leeren: vor dem Request liegt nie Body darin)
-    // Chunk-Puffer: jeder write() schickt beim Core einen eigenen TLS-Record samt
-    // flush(). Längster Request: Pfad 1151 + Host 47 + ~200 B Rest < CHUNK_LEN.
+    // Stack statt RunContext: der Puffer wird nur hier gebraucht (~0,8 kB mit Kopf und Range;
+    // der Stack von loop() hat 4 kB, BearSSL rechnet auf dem StackThunk). Längster Request:
+    // Pfad 1151 + Host 47 + ~220 B Rest.
     char port[8] = "";
     if (r.port != 443) snprintf(port, sizeof(port), ":%u", r.port);
     // Assets immer als Range ab dem aktuellen Offset (Begründung: Kopfkommentar,
@@ -605,16 +857,24 @@ static bool sendRequest(RunContext &r) {
         snprintf_P(range, sizeof(range), PSTR("Range: bytes=%u-%u\r\n"), r.received,
                    std::min(r.received + RANGE_LEN, a.size) - 1);
     }
-    char *req = reinterpret_cast<char *>(r.chunk);
     // identity: das Gerät streamt die Bytes 1:1 in den Flash, gzip/chunked kann es nicht
-    int n = snprintf_P(req, sizeof(r.chunk),
-                       PSTR("GET %s HTTP/1.1\r\nHost: %s%s\r\nUser-Agent: PresenceTrack/" FIRMWARE_VERSION
-                            "\r\nAccept: */*\r\nAccept-Encoding: identity\r\n%sConnection: %s\r\n\r\n"),
-                       r.path, r.host, port, range, r.fetch == Fetch::Manifest ? "close" : "keep-alive");
+    char tail[256];
+    const int n = snprintf_P(tail, sizeof(tail),
+                             PSTR(" HTTP/1.1\r\nHost: %s%s\r\nUser-Agent: PresenceTrack/" FIRMWARE_VERSION
+                                  "\r\nAccept: */*\r\nAccept-Encoding: identity\r\n%sConnection: %s\r\n\r\n"),
+                             r.host, port, range, r.fetch == Fetch::Manifest ? "close" : "keep-alive");
     // Kein setError() hier: auf einer Keep-Alive-Verbindung ist ein Fehlschlag
-    // nur ein Grund zum Neuverbinden (nextRange)
-    if (n < 0 || (size_t)n >= sizeof(r.chunk)) return false;
-    return r.client->write(r.chunk, n) == (size_t)n;
+    // nur ein Grund zum Neuverbinden (stepRequest)
+    if (n < 0 || (size_t)n >= sizeof(tail)) return false;
+    RequestWriter w;
+    w.client = r.client;
+    w.len = 0;
+    w.ok = true;
+    w.add("GET ", 4);
+    w.add(r.path, strlen(r.path));
+    w.add(tail, n);
+    w.send();
+    return w.ok;
 }
 
 static bool isRedirect(int status) {
@@ -807,64 +1067,212 @@ static int sslErrorText(RunContext &r, char *text, size_t len) {
 //            ClientContext in WiFiClient::connect() (WiFiClient.cpp:153, 161)
 //   Sitzung  br_ssl_client_context (make_shared, WiFiClientSecureBearSSL.cpp:1135),
 //            Empfangs- und Sendepuffer mit je eigenem Kontrollblock (_alloc_iobuf,
-//            Zeile 1137-1138), X509InsecureSizeMirror (make_shared, Zeile 1058)
+//            Zeile 1137-1138), X509InsecureSizeMirror (make_shared, Zeile 1058; nach dem
+//            Handshake wieder frei, Zeile 1206)
 // sizeof im Build (Core 3.1.2): TlsClient 208, tcp_pcb 184, ClientContext 52,
-// br_ssl_client_context 3408, X509InsecureSizeMirror 1480. Damit Socket 6692 B
-// (mit StackThunk), Sitzung 10554 B, zusammen 17246 B.
+// br_ssl_client_context 3408, X509InsecureSizeMirror 1480 (zum Vergleich: der Wrapper
+// BearSSL::WiFiClientSecure kostete 40 B + shared_ptr auf denselben Kontext zusätzlich).
+// Damit Socket 6692 B (mit StackThunk), Sitzung 5946 B + Empfangspuffer 1024 B = 6970 B,
+// zusammen 13662 B; ohne den X.509-Kontext (1508 B) 12154 B.
 static constexpr uint32_t tlsSocketBytes(bool withStackThunk) {
     return sizeof(TlsClient) + (withStackThunk ? TLS_STACK_THUNK_BYTES + UMM_ALLOC_SLACK : 0) + sizeof(tcp_pcb) +
            TLS_CLIENT_CONTEXT_BYTES + 3 * UMM_ALLOC_SLACK;
 }
 
-static constexpr uint32_t tlsSessionBytes() {
-    return sizeof(br_ssl_client_context) + TLS_SHARED_INPLACE_BYTES + TLS_RX + TLS_IN_OVERHEAD +
+static constexpr uint32_t tlsSessionBytes(int rx) {
+    return sizeof(br_ssl_client_context) + TLS_SHARED_INPLACE_BYTES + rx + TLS_IN_OVERHEAD +
            TLS_SHARED_DELETER_BYTES + TLS_TX + TLS_OUT_OVERHEAD + TLS_SHARED_DELETER_BYTES +
            sizeof(X509InsecureSizeMirror) + TLS_SHARED_INPLACE_BYTES + 6 * UMM_ALLOC_SLACK;
+}
+
+static const uint32_t TLS_X509_BYTES = sizeof(X509InsecureSizeMirror) + TLS_SHARED_INPLACE_BYTES + UMM_ALLOC_SLACK;
+
+// Bedarf vor einem Aufbauschritt: was von der Verbindung noch fehlt (socket = 0, wenn der
+// Socket schon steht) plus die Reserve des Zeitpunkts, der am meisten braucht (Kommentar bei
+// RESERVE_WEB): Handshake mit, Request und Transfer ohne X.509-Kontext, der noch ausstehende
+// Flash-Puffer (flash) erst im Transfer.
+static constexpr uint32_t tlsNeedBytes(int rx, uint32_t socket, uint32_t flash) {
+    return std::max(socket + tlsSessionBytes(rx) + RESERVE_HANDSHAKE,
+                    std::max(socket + tlsSessionBytes(rx) - TLS_X509_BYTES + RESERVE_REQUEST,
+                             socket + tlsSessionBytes(rx) - TLS_X509_BYTES + flash + RESERVE_TRANSFER));
+}
+
+static int tlsRxFor(Fetch f) {
+    return f == Fetch::Manifest ? TLS_RX_MANIFEST : TLS_RX_ASSET;
+}
+
+// Der Updater-Puffer eines Asset-Fetches kommt erst mit dem ersten Record (beginFlash),
+// nach dem Handshake; bis dahin zählt er zum Bedarf. Bei einem Reconnect ist er schon belegt.
+static uint32_t pendingFlashBufferBytes(const RunContext &r) {
+    return r.fetch != Fetch::Manifest && !r.updateStarted ? UPDATER_BUFFER_BYTES : 0;
 }
 
 // Die Zahlen der Kommentare (Kopf, Speicher und oben) gegen den Build: ändert ein
 // Core- oder Library-Update eine Größe, bricht der Build hier, statt dass die
 // Heap-Rechnung still von der Beschreibung abweicht.
-static_assert(sizeof(RunContext) == 3264, "RunContext: Kopfkommentar (Speicher) nachführen");
+static_assert(sizeof(RunContext) == 1840, "RunContext: Kopfkommentar (Speicher) nachführen");
 static_assert(sizeof(TlsClient) == 208 && sizeof(tcp_pcb) == 184 && sizeof(br_ssl_client_context) == 3408 &&
                   sizeof(X509InsecureSizeMirror) == 1480,
               "sizeof-Liste bei tlsSocketBytes nachführen");
-static_assert(tlsSocketBytes(true) == 6692 && tlsSessionBytes() == 10554, "Bedarf pro Verbindung nachführen");
-static_assert(TLS_HEAP_RESERVE == 6752 && tlsSocketBytes(true) + tlsSessionBytes() + TLS_HEAP_RESERVE == 23998,
-              "Bedarf samt Reserve im Kopfkommentar nachführen");
+static_assert(tlsSocketBytes(true) == 6692 && tlsSessionBytes(TLS_RX_MANIFEST) == 6970 &&
+                  tlsSessionBytes(TLS_RX_ASSET) == 6970 && TLS_X509_BYTES == 1508,
+              "Bedarf pro Verbindung nachführen");
+static_assert(sizeof(pbuf) == 16 && sizeof(tcp_seg) == 16 && RX_FRAME_OVERHEAD == 82 && RX_SEGMENT_BYTES == 618 &&
+                  TX_SEGMENT_OVERHEAD == 146,
+              "lwIP-Größen bei RESERVE_WEB nachführen");
+static_assert(RESERVE_TLS_RX == 2472 && RESERVE_TLS_TX_HANDSHAKE == 1035 && RESERVE_TLS_TX_REQUEST == 1510 &&
+                  RESERVE_MQTT == 463 && RESERVE_WEB == 2692,
+              "Posten im Kommentar bei RESERVE_WEB nachführen");
+static_assert(RESERVE_HANDSHAKE == 3970 && RESERVE_REQUEST == 4445 && RESERVE_TRANSFER == 5627,
+              "Reserve je Zeitpunkt im Kommentar bei RESERVE_WEB nachführen");
+static_assert(tlsNeedBytes(TLS_RX_MANIFEST, tlsSocketBytes(true), 0) == 17781 &&
+                  tlsNeedBytes(TLS_RX_ASSET, tlsSocketBytes(true), UPDATER_BUFFER_BYTES) == 18049,
+              "Bedarf check/Asset im Kopfkommentar (Speicher) nachführen");
+// Zielvorgabe für dieses Gerät (im schlechtesten Moment 19024 B frei, siehe Kopfkommentar)
+static_assert(tlsNeedBytes(TLS_RX_MANIFEST, tlsSocketBytes(true), 0) <= 18000 &&
+                  tlsNeedBytes(TLS_RX_ASSET, tlsSocketBytes(true), UPDATER_BUFFER_BYTES) <= 19000,
+              "Bedarf über der Zielvorgabe");
+// beginUpdater() verlässt sich darauf: 4096 B nimmt der Updater erst ab 8193 B frei, danach
+// wären noch >= 4084 B frei - weniger als die Transfer-Reserve, also muss er klein bleiben.
+static_assert(2 * FLASH_SECTOR_SIZE - FLASH_SECTOR_SIZE - UMM_ALLOC_SLACK < RESERVE_TRANSFER,
+              "beginUpdater: Blockade ist nicht mehr nötig");
 
-// Passt die Verbindung samt TLS_HEAP_RESERVE in den Heap? Vorab statt es darauf
-// ankommen zu lassen: bis auf TlsClient und die beiden Puffer belegt der Core alles
-// mit normalem `new` bzw. malloc()+abort() (StackThunk) - OOM ist dort ein Neustart,
-// kein Fehlercode. Die Summe allein genügt nicht, StackThunk (6200 B) und
-// Empfangspuffer (4933 B) brauchen je einen zusammenhängenden Block. Deshalb werden
-// die großen Blöcke in der Reihenfolge des Cores einmal testweise belegt und sofort
-// wieder freigegeben; danach ist der Heap wie vorher (umm_malloc vereinigt freie
-// Nachbarblöcke, Best-Fit, umm_malloc_cfg.h:136).
+// Passt die Verbindung samt Reserve (und beim Asset dem Updater-Puffer) in den Heap?
+// Vorab statt es darauf ankommen zu lassen: bis auf TlsClient und die beiden Puffer
+// belegt der Core alles mit normalem `new` bzw. malloc()+abort() (StackThunk) - OOM ist
+// dort ein Neustart, kein Fehlercode. Die Summe allein genügt nicht, StackThunk (6200 B),
+// Sitzung (3424 B), X.509-Kontext (1496 B) und Empfangspuffer (1349 B) brauchen je einen
+// zusammenhängenden Block. Deshalb werden die großen Blöcke in der Reihenfolge des Cores
+// einmal testweise belegt und sofort wieder freigegeben; danach ist der Heap wie vorher
+// (umm_malloc vereinigt freie Nachbarblöcke, Best-Fit, umm_malloc_cfg.h:136).
 // withSocket: vor dem TCP-Aufbau (alles), sonst nur noch der Sitzungsteil.
-static bool tlsHeapAvailable(RunContext &r, bool withSocket) {
+// report: sonst nur prüfen (Wartezeit, HEAP_WAIT_MS); mit report die Meldung mit allen Zahlen.
+static bool tlsHeapAvailable(RunContext &r, bool withSocket, bool report) {
     const bool withStack = withSocket && stack_thunk_get_refcnt() == 0;
-    const uint32_t conn = (withSocket ? tlsSocketBytes(withStack) : 0) + tlsSessionBytes();
-    const uint32_t need = conn + TLS_HEAP_RESERVE;
+    const int rx = tlsRxFor(r.fetch);
+    const uint32_t socket = withSocket ? tlsSocketBytes(withStack) : 0;
+    const uint32_t conn = socket + tlsSessionBytes(rx);
+    const uint32_t flashBuf = pendingFlashBufferBytes(r);
+    const uint32_t need = tlsNeedBytes(rx, socket, flashBuf);
+    const uint32_t reserve = need - conn - flashBuf;
     const uint32_t freeHeap = ESP.getFreeHeap();
     const size_t blocks[] = {withStack ? TLS_STACK_THUNK_BYTES : 0,
                              sizeof(br_ssl_client_context) + TLS_SHARED_INPLACE_BYTES,
-                             TLS_RX + TLS_IN_OVERHEAD, TLS_TX + TLS_OUT_OVERHEAD};
-    void *probe[4] = {};
+                             rx + TLS_IN_OVERHEAD, TLS_TX + TLS_OUT_OVERHEAD,
+                             sizeof(X509InsecureSizeMirror) + TLS_SHARED_INPLACE_BYTES};
+    const size_t count = sizeof(blocks) / sizeof(blocks[0]);
+    void *probe[count] = {};
     bool fits = freeHeap >= need;
-    for (size_t i = 0; fits && i < 4; i++) {
+    for (size_t i = 0; fits && i < count; i++) {
         if (blocks[i] && !(probe[i] = malloc(blocks[i]))) fits = false;
     }
-    for (size_t i = 4; i-- > 0;) free(probe[i]);
-    if (fits) return true;
+    for (size_t i = count; i-- > 0;) free(probe[i]);
     const uint32_t largest = ESP.getMaxFreeBlockSize();
-    setError("not enough heap for TLS to %s: %u B free, largest block %u B; needed %u B "
-             "(connection %u + reserve %u) in blocks up to %u B - nothing was attempted",
-             r.host, freeHeap, largest, need, conn, TLS_HEAP_RESERVE,
-             (unsigned)(withStack ? TLS_STACK_THUNK_BYTES : TLS_RX + TLS_IN_OVERHEAD));
-    logLine("%s %s: Heap reicht nicht, %u B frei, größter Block %u B, nötig %u B (Verbindung %u + Reserve %u)",
-            phaseName(r.phase), r.host, freeHeap, largest, need, conn, TLS_HEAP_RESERVE);
+    if (fits) {
+        if (r.heapWaiting) {
+            logLine("%s %s: Heap reicht nach %lu ms, %u B frei, nötig %u B", phaseName(r.phase), r.host,
+                    millis() - r.heapWaitStartMs, freeHeap, need);
+        }
+        return true;
+    }
+    if (!report) {
+        if (!r.heapWaiting) {
+            r.heapWaiting = true;
+            logLine("%s %s: Heap reicht noch nicht (%u B frei, größter Block %u B, nötig %u B), warte bis %lu s",
+                    phaseName(r.phase), r.host, freeHeap, largest, need, HEAP_WAIT_MS / 1000);
+        }
+        return false;
+    }
+    const unsigned block = withStack ? TLS_STACK_THUNK_BYTES : blocks[1];
+    const unsigned long waited = (millis() - r.heapWaitStartMs) / 1000;
+    if (flashBuf) {
+        setError("not enough heap for TLS to %s: %u B free, largest block %u B; needed %u B "
+                 "(connection %u + flash buffer %u + reserve %u) in blocks up to %u B after %lu s - "
+                 "nothing was attempted",
+                 r.host, freeHeap, largest, need, conn, flashBuf, reserve, block, waited);
+    } else {
+        setError("not enough heap for TLS to %s: %u B free, largest block %u B; needed %u B "
+                 "(connection %u + reserve %u) in blocks up to %u B after %lu s - nothing was attempted",
+                 r.host, freeHeap, largest, need, conn, reserve, block, waited);
+    }
+    logLine("%s %s: Heap reicht nicht, %u B frei, größter Block %u B, nötig %u B (Verbindung %u + Flash-Puffer %u "
+            "+ Reserve %u)",
+            phaseName(r.phase), r.host, freeHeap, largest, need, conn, flashBuf, reserve);
     return false;
+}
+
+// Heap-Prüfung vor einem Aufbauschritt, mit Wartezeit: Continue = später noch einmal.
+static Step checkTlsHeap(RunContext &r, bool withSocket) {
+    if (!r.heapWaiting) r.heapWaitStartMs = millis();
+    const bool last = millis() - r.heapWaitStartMs >= HEAP_WAIT_MS;
+    if (tlsHeapAvailable(r, withSocket, last)) return Step::Finished;
+    return last ? Step::Failed : Step::Continue;
+}
+
+// Tiefstwert des Laufs an den Stellen, an denen der Heap am knappsten ist (Takt-Beginn, nach
+// Handshake, Request und Update.begin, nach jedem Record). Spitzen mitten in lwIP-Callbacks
+// sieht nur umm_free_heap_size_min() (seit Boot, endRun nennt beides).
+static void noteHeap(RunContext &r) {
+    const uint32_t heap = ESP.getFreeHeap();
+    if (heap < r.minHeap) r.minHeap = heap;
+}
+
+// ---------------------------------------------------------------------------
+// Webserver-Pause
+//
+// Solange eine Verbindung aufgebaut wird (Tcp, Tls) oder ihr Request unterwegs ist,
+// nimmt der Webserver keine Verbindung an (firmwareUpdateHttpConnections() == 0,
+// umgesetzt über das Listen-Backlog in web_server.cpp), und der Aufbau beginnt erst, wenn
+// keine mehr offen ist. So braucht ein Status-Poll (RESERVE_WEB, 2692 B) nie zugleich mit
+// dem X.509-Kontext (1508 B) bzw. dem TLS-Senden (1510 B) Platz. Ein SYN in dieser Zeit
+// verwirft lwIP, der Browser wiederholt es (~1 s, 3 s, 7 s): der Poll kommt später durch,
+// scheitert aber nicht. Der wartende install-Request zählt nicht mit (web_server.cpp).
+// ---------------------------------------------------------------------------
+
+// Obergrenze fürs Warten auf offene HTTP-Verbindungen. ESPAsyncTCP schließt eine Verbindung
+// ohne empfangene Daten nach 3 s (setRxTimeout(3), LimitedWebServer in web_server.cpp) und
+// eine ohne ACK nach 5 s (ASYNC_MAX_ACK_TIME, ESPAsyncTCP.h:40); ein Status-Poll dauert
+// Millisekunden. 30 s lassen auch eine langsame Antwort (Seite neu geladen) zu Ende laufen.
+static const unsigned long WEB_IDLE_WAIT_MS = 30000;
+
+static void holdWeb(RunContext &r, bool hold) {
+    if (r.webHold == hold) return;
+    r.webHold = hold;
+    webServerApplyConnectionLimit();
+}
+
+uint8_t firmwareUpdateHttpConnections() {
+    return s_run && s_run->webHold ? 0 : FW_UPDATE_HTTP_CONNECTIONS;
+}
+
+// Pausiert den Webserver und wartet, bis keine Verbindung mehr offen ist: Finished = frei,
+// Continue = später noch einmal, Failed nach WEB_IDLE_WAIT_MS (Meldung gesetzt).
+static Step waitWebIdle(RunContext &r) {
+    holdWeb(r, true);
+    const uint8_t open = webServerOpenConnections();
+    const unsigned long now = millis();
+    if (open == 0) {
+        if (r.webWaiting && now - r.webWaitStartMs >= 1000) {
+            logLine("%s %s: Webserver nach %lu ms frei", phaseName(r.phase), r.host, now - r.webWaitStartMs);
+        }
+        r.webWaiting = false;
+        return Step::Finished;
+    }
+    if (!r.webWaiting) {
+        r.webWaiting = true;
+        r.webWaitStartMs = now;
+    }
+    if (now - r.webWaitStartMs < WEB_IDLE_WAIT_MS) return Step::Continue;
+    setError("%u HTTP connection(s) still open after %lu s, the connection to %s was not attempted", open,
+             WEB_IDLE_WAIT_MS / 1000, r.host);
+    return Step::Failed;
+}
+
+// Webserver wieder offen: zwischen zwei Hops (keine TLS-Verbindung) und sobald der Request
+// bestätigt ist - danach kommt nur noch der Transfer (RESERVE_TRANSFER rechnet den Poll ein).
+static bool webMayRun(RunContext &r) {
+    if (r.phase == Phase::Resolve) return true;
+    return (r.phase == Phase::Headers || r.phase == Phase::Body) && r.client && r.client->tcpAcked();
 }
 
 // DNS ohne Blockieren: erster Takt stellt die Anfrage, die folgenden prüfen nur.
@@ -914,16 +1322,22 @@ static Step stepResolve(RunContext &r) {
     return Step::Continue;
 }
 
-// TCP zur aufgelösten IP. Blockiert bis TCP_CONNECT_TIMEOUT_MS (Kopfkommentar).
+// TCP zur aufgelösten IP. Blockiert bis TCP_CONNECT_TIMEOUT_MS (Kopfkommentar). Vorher
+// wird der Webserver pausiert und der Heap erst gemessen, wenn keine HTTP-Verbindung mehr
+// offen ist - deren Heap zählt die Reserve dieses Zeitpunkts nicht (Webserver-Pause).
 static Step stepTcp(RunContext &r) {
-    if (!tlsHeapAvailable(r, true)) return Step::Failed;
+    const Step web = waitWebIdle(r);
+    if (web != Step::Finished) return web;
+    const Step heap = checkTlsHeap(r, true);
+    if (heap != Step::Finished) return heap;
     r.client = new (std::nothrow) TlsClient();
     if (!r.client) {
         setError("out of memory for the TLS client to %s", r.host);
         return Step::Failed;
     }
     r.client->setInsecure(); // Begründung siehe Kopfkommentar
-    r.client->setBufferSizes(TLS_RX, TLS_TX);
+    // Puffer nach dem, was diese Verbindung holt - fest ab hier, kein Rückfall (Kopfkommentar)
+    r.client->setBufferSizes(tlsRxFor(r.fetch), TLS_TX);
     r.client->setTimeout(TCP_CONNECT_TIMEOUT_MS); // erreicht WiFiClient::connect(), WiFiClient.cpp:163
     const unsigned long start = millis();
     const bool ok = r.client->connectTcp(IPAddress(r.ip), r.port);
@@ -939,6 +1353,9 @@ static Step stepTcp(RunContext &r) {
                 timeout ? "keine Antwort" : "abgewiesen");
         return Step::Failed;
     }
+    // Request und Handshake in genau passenden Segmenten statt MSS-großer pbufs
+    // (RESERVE_TLS_TX_REQUEST, TCP_OVERSIZE); geht an tcp_nagle_disable (ClientContext.h:166-175)
+    r.client->setNoDelay(true);
     logLine("TCP %s:%u verbunden (%lu ms)", ip.s, r.port, ms);
     enterPhase(r, Phase::Tls);
     return Step::Continue;
@@ -953,10 +1370,12 @@ static Step stepTls(RunContext &r) {
         logLine("TLS %s: TCP schon wieder zu, BearSSL lief nicht", r.host);
         return Step::Failed;
     }
-    // Zwischen den Takten kann der Heap geschrumpft sein (Webserver, MQTT)
-    if (!tlsHeapAvailable(r, false)) return Step::Failed;
+    // Zwischen den Takten kann der Heap geschrumpft sein (MQTT, fremde Pakete)
+    const Step heap = checkTlsHeap(r, false);
+    if (heap != Step::Finished) return heap;
     const uint32_t heapBefore = ESP.getFreeHeap();
-    logLine("TLS %s: Handshake, Heap %u B, größter Block %u B", r.host, heapBefore, ESP.getMaxFreeBlockSize());
+    logLine("TLS %s: Handshake, Heap %u B, größter Block %u B, Empfangspuffer %d B", r.host, heapBefore,
+            ESP.getMaxFreeBlockSize(), tlsRxFor(r.fetch));
     const unsigned long start = millis();
     const bool ok = r.client->handshake(r.host);
     const unsigned long ms = millis() - start;
@@ -979,21 +1398,26 @@ static Step stepTls(RunContext &r) {
         return Step::Failed;
     }
     const uint32_t heapAfter = ESP.getFreeHeap();
+    noteHeap(r);
     logLine("TLS %s: ok nach %lu ms, Heap %u -> %u B (%d B belegt), größter Block %u B", r.host, ms, heapBefore,
             heapAfter, (int)(heapBefore - heapAfter), ESP.getMaxFreeBlockSize());
-    if (heapAfter < TLS_HEAP_RESERVE) {
+    const uint32_t needAfter = TLS_HEAP_RESERVE_AFTER + pendingFlashBufferBytes(r);
+    if (heapAfter < needAfter) {
         // Die Prüfung vorab hat sich verschätzt: lieber hier abbrechen als in einem `new` später
-        setError("only %u B heap left after the TLS setup to %s, reserve is %u B - aborted", heapAfter, r.host,
-                 TLS_HEAP_RESERVE);
-        logLine("TLS %s: Reserve unterschritten (%u < %u B), Abbruch", r.host, heapAfter, TLS_HEAP_RESERVE);
+        setError("only %u B heap left after the TLS setup to %s, needed %u B (request or web %u + flash buffer %u)"
+                 " - aborted",
+                 heapAfter, r.host, needAfter, TLS_HEAP_RESERVE_AFTER, pendingFlashBufferBytes(r));
+        logLine("TLS %s: Reserve unterschritten (%u < %u B), Abbruch", r.host, heapAfter, needAfter);
         return Step::Failed;
     }
+    // Der Webserver bleibt pausiert, bis lwIP den Request bestätigt hat (webMayRun)
     if (!sendRequest(r)) {
         char text[112];
         const int code = sslErrorText(r, text, sizeof(text));
         setError("sending the request to %s failed (BearSSL %d - %s)", r.host, code, text);
         return Step::Failed;
     }
+    noteHeap(r);
     resetHeaderParser(r.hdr);
     r.fill = 0;
     enterPhase(r, Phase::Headers);
@@ -1032,8 +1456,9 @@ static Step onHeadersDone(RunContext &r) {
             setError("manifest.json: HTTP %d from %s", h.status, r.host);
             return Step::Failed;
         }
-        if (h.contentLength <= 0 || (size_t)h.contentLength > sizeof(r.chunk)) {
-            setError("manifest.json: Content-Length %d, expected 1..%u B", h.contentLength, (unsigned)sizeof(r.chunk));
+        // Der Body kommt als ein Record, der muss in den Empfangspuffer (TLS_RX_MANIFEST)
+        if (h.contentLength <= 0 || (size_t)h.contentLength > MANIFEST_MAX_LEN) {
+            setError("manifest.json: Content-Length %d, expected 1..%u B", h.contentLength, (unsigned)MANIFEST_MAX_LEN);
             return Step::Failed;
         }
         r.bodyEnd = h.contentLength;
@@ -1070,8 +1495,8 @@ static Step onHeadersDone(RunContext &r) {
                 r.fetch == Fetch::Manifest ? r.bodyEnd : (r.fetch == Fetch::Firmware ? r.firmware.size : r.filesystem.size),
                 r.keepAlive ? "ja" : "nein");
     }
-    // Was schon hinter den Headern im Puffer lag, ist Body; mehr als angekündigt wird verworfen
-    if (r.fill > r.bodyEnd - r.received) r.fill = r.bodyEnd - r.received;
+    // Der Body liegt noch im Empfangspuffer (stepHeaders hat genau bis zur Leerzeile verbraucht)
+    r.fill = 0;
     enterPhase(r, Phase::Body);
     r.lastDataMs = millis();
     return Step::Continue;
@@ -1081,24 +1506,40 @@ static Step onHeadersDone(RunContext &r) {
 // sie geschlossen hat (Pfad und Host bleiben: die signierte CDN-URL gilt weiter).
 // Ohne Obergrenze für Reconnects: hierher kommt ein Lauf nur nach einer
 // vollständig gelieferten Range, jede Verbindung bringt also Fortschritt, und
-// mehr als size / RANGE_LEN (250 für littlefs.bin) können es nicht werden. Ein
+// mehr als size / RANGE_LEN (1000 für littlefs.bin) können es nicht werden. Ein
 // Server, der jede Antwort mit "Connection: close" beendet, kostet dann einen
 // Handshake pro Range - langsam, aber korrekt. Bricht die Verbindung mitten in
-// einer Range ab, scheitert der Download (fillChunk).
+// einer Range ab, scheitert der Download (peekBody).
 static Step nextRange(RunContext &r) {
     if (r.keepAlive && r.client && r.client->connected()) {
-        if (sendRequest(r)) {
-            resetHeaderParser(r.hdr);
-            enterPhase(r, Phase::Headers);
-            return Step::Continue;
-        }
-        // Senden gescheitert: wie eine vom Server geschlossene Verbindung behandeln
+        enterPhase(r, Phase::Request);
+        return Step::Continue;
     }
     closeClient(r);
     enterPhase(r, Phase::Resolve);
     return Step::Continue;
 }
 
+// Request der nächsten Range, sobald der Webserver still ist: das TLS-Senden (bis
+// RESERVE_TLS_TX_REQUEST) soll nie mit einem Poll zusammenfallen (Webserver-Pause).
+// Ein laufender Poll dauert Millisekunden, die Range wartet so lange.
+static Step stepRequest(RunContext &r) {
+    const Step web = waitWebIdle(r);
+    if (web != Step::Finished) return web;
+    if (r.client->connected() && sendRequest(r)) {
+        noteHeap(r);
+        resetHeaderParser(r.hdr);
+        enterPhase(r, Phase::Headers);
+        return Step::Continue;
+    }
+    // Inzwischen geschlossen oder Senden gescheitert: neu verbinden
+    closeClient(r);
+    enterPhase(r, Phase::Resolve);
+    return Step::Continue;
+}
+
+// Antwortkopf direkt aus dem Empfangspuffer: verbraucht wird genau bis zur Leerzeile,
+// der Rest des Records ist Body und bleibt für stepBody liegen.
 static Step stepHeaders(RunContext &r) {
     if (millis() - r.phaseStartMs > HEADER_TIMEOUT_MS) {
         setError("%s: no complete HTTP response from %s within %lu s", fetchName(r.fetch), r.host, HEADER_TIMEOUT_MS / 1000);
@@ -1106,7 +1547,8 @@ static Step stepHeaders(RunContext &r) {
     }
     const unsigned long start = millis();
     while (millis() - start < TICK_BUDGET_MS) {
-        int n = r.client->read(r.chunk, sizeof(r.chunk));
+        const uint8_t *data;
+        const int n = r.client->peekRecord(data);
         if (n == 0) return Step::Continue;
         if (n < 0) {
             char text[112];
@@ -1115,40 +1557,38 @@ static Step stepHeaders(RunContext &r) {
             return Step::Failed;
         }
         for (int i = 0; i < n; i++) {
-            if (!feedHeader(r, (char)r.chunk[i])) return Step::Failed;
+            if (!feedHeader(r, (char)data[i])) return Step::Failed;
             if (r.hdr.state == HdrState::Done) {
-                r.fill = n - i - 1;
-                memmove(r.chunk, r.chunk + i + 1, r.fill);
+                r.client->peekConsume(i + 1);
                 return onHeadersDone(r);
             }
         }
+        r.client->peekConsume(n);
     }
     return Step::Continue;
 }
 
-// Liest in r.chunk bis `want` Bytes darin liegen. Continue = noch nicht voll
-// (später weiter), Finished = voll, Failed = Verbindung weg/abgelaufen.
-static Step fillChunk(RunContext &r, size_t want, uint32_t total) {
-    while (r.fill < want) {
-        int n = r.client->read(r.chunk + r.fill, want - r.fill);
-        if (n == 0) {
-            if (millis() - r.lastDataMs > BODY_IDLE_TIMEOUT_MS) {
-                setError("%s: download stalled at %u of %u bytes", fetchName(r.fetch), (unsigned)(r.received + r.fill), total);
-                return Step::Failed;
-            }
-            return Step::Continue;
+// Nächstes Stück Body aus dem Empfangspuffer, höchstens want Bytes, gültig bis
+// peekConsume(). >0 Bytes, 0 = noch nichts da (später weiter), -1 = Verbindung
+// weg/abgelaufen (Meldung gesetzt).
+static int peekBody(RunContext &r, const uint8_t *&data, size_t want, uint32_t total) {
+    const int n = r.client->peekRecord(data);
+    if (n == 0) {
+        if (millis() - r.lastDataMs > BODY_IDLE_TIMEOUT_MS) {
+            setError("%s: download stalled at %u of %u bytes", fetchName(r.fetch), (unsigned)(r.received + r.fill), total);
+            return -1;
         }
-        if (n < 0) {
-            char text[112];
-            const int code = sslErrorText(r, text, sizeof(text));
-            setError("%s: connection lost at %u of %u bytes (BearSSL %d - %s)", fetchName(r.fetch),
-                     (unsigned)(r.received + r.fill), total, code, text);
-            return Step::Failed;
-        }
-        r.fill += n;
-        r.lastDataMs = millis();
+        return 0;
     }
-    return Step::Finished;
+    if (n < 0) {
+        char text[112];
+        const int code = sslErrorText(r, text, sizeof(text));
+        setError("%s: connection lost at %u of %u bytes (BearSSL %d - %s)", fetchName(r.fetch),
+                 (unsigned)(r.received + r.fill), total, code, text);
+        return -1;
+    }
+    r.lastDataMs = millis();
+    return (int)std::min<size_t>(n, want);
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,7 +1648,7 @@ static bool parseAsset(JsonObjectConst root, const char *key, Asset &a) {
     return true;
 }
 
-// Liest das Manifest aus r.chunk (r.fill Bytes). Unbekannte Keys (tag, board,
+// Liest das Manifest aus r.path (r.fill Bytes, stepBody). Unbekannte Keys (tag, board,
 // commit, built_at, künftige) überliest der Filter, ohne dafür Speicher zu belegen.
 static bool parseManifest(RunContext &r) {
     JsonDocument filter;
@@ -1221,7 +1661,7 @@ static bool parseManifest(RunContext &r) {
         f["sha256"] = true;
     }
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, reinterpret_cast<const char *>(r.chunk), r.fill,
+    DeserializationError err = deserializeJson(doc, static_cast<const char *>(r.path), r.fill,
                                                DeserializationOption::Filter(filter));
     if (err) {
         setError("manifest: invalid JSON (%s)", err.c_str());
@@ -1280,10 +1720,22 @@ static void endRun(FwUpdateState state) {
         const bool check = s_run->job == Job::Check;
         free(s_run);
         s_run = nullptr;
+        // Webserver-Pause aufheben, ohne auf den nächsten webServerLoop() zu warten
+        webServerApplyConnectionLimit();
+        const unsigned bootMin = umm_free_heap_size_min();
+        const unsigned stackFree = ESP.getFreeContStack(); // Tiefstwert seit Boot (bemalter Stack)
         // Tiefstwert "seit Boot" ist exakt (UMM_STATS_FULL) und erfasst auch Spitzen
-        // mitten im Handshake, die die Messung pro Takt nicht sieht
-        logLine("Lauf beendet (%s): Heap jetzt %u B, Tiefstwert im Lauf %u B (je Takt), seit Boot %u B",
-                check ? "check" : "install", ESP.getFreeHeap(), minHeap, (unsigned)umm_free_heap_size_min());
+        // mitten im Handshake, die die Messpunkte (noteHeap) nicht sehen
+        logLine("Lauf beendet (%s): Heap jetzt %u B, Tiefstwert im Lauf %u B (Messpunkte), seit Boot %u B, "
+                "Stack von loop() min. %u B frei",
+                check ? "check" : "install", ESP.getFreeHeap(), minHeap, bootMin, stackFree);
+        // Auch ins Ereignisprotokoll (/api/events): mit dem LD2450 an D7/D8 ist Serial nach dem
+        // Boot stumm (serialLogEnabled). "heap <Lauf>/<seit Boot>", max. 47 Zeichen
+        // (LogEvent::message); formatiert aus dem Flash, eventLogPush() nähme den Text aus dem DRAM.
+        char msg[48];
+        snprintf_P(msg, sizeof(msg), PSTR("GitHub %s: heap %u/%u, stack %u B"), check ? "check" : "update", minHeap,
+                   bootMin, stackFree);
+        eventLogPush(EventType::OtaUpdate, "%s", msg);
     }
     clearRtcMark();
     setState(state);
@@ -1304,7 +1756,7 @@ static void failRun() {
         Update.end();
     }
     // Nur wenn Update.begin() lief: ein check oder ein Install, der vor dem ersten
-    // Chunk scheitert, hat den Schlafmodus nie angefasst
+    // Record scheitert, hat den Schlafmodus nie angefasst
     if (r.sleepForced) wifiPowerApplyConfig(s_cfg->wifi);
     if (r.fsTouched && !r.fsWritten) {
         // Noch nichts geschrieben: das alte Dateisystem ist intakt
@@ -1389,24 +1841,71 @@ static Step onAssetDone(RunContext &r) {
     return Step::Finished;
 }
 
-// Erster Chunk eines Assets: alles, was das Image ablehnen kann, läuft vor
-// Update.begin(), also vor dem ersten Flash-Erase (für littlefs.bin auch vor
-// dem Aushängen des Dateisystems).
-static bool beginFlash(RunContext &r, const Asset &a) {
+// Update.begin() mit dem kleinen Puffer, wenn der große die Reserve verletzen würde.
+// Updater.cpp:172-177: mehr als 2 x FLASH_SECTOR_SIZE (8192 B) frei -> 4096 B, sonst 256 B.
+// Hier, mit offener CDN-Verbindung (X.509 ist nach dem Handshake wieder frei), sind bei
+// 21216 B vor dem Aufbau 21216 - 12154 = 9062 B frei - der Updater nähme 4108 B und ließe
+// 4954 B, 673 B unter der Transfer-Reserve (5627 B). Deshalb wird der Heap für den Aufruf
+// kurz unter 8193 B gedrückt: bis zu UPDATER_HOLD_BLOCKS Blöcke (einer genügt, wenn der
+// größte Block reicht) und sofort wieder frei. Dazwischen läuft nichts anderes: begin() ruft
+// weder yield() noch delay() (Updater.cpp bis Zeile 185), lwIP und der Webserver kommen erst
+// danach wieder dran. Der kleine Puffer ist der Weg, den der Core selbst bei knappem Heap
+// geht: je 256 B ein Flash-Write, Erase weiterhin pro Sektor (Updater.cpp:380-382).
+static const uint8_t UPDATER_HOLD_BLOCKS = 4;
+
+static bool beginUpdater(RunContext &r, uint32_t size, int command) {
+    void *hold[UPDATER_HOLD_BLOCKS] = {};
+    const uint32_t before = ESP.getFreeHeap();
+    if (before < RESERVE_TRANSFER + FLASH_SECTOR_SIZE + UMM_ALLOC_SLACK) {
+        for (uint8_t i = 0; i < UPDATER_HOLD_BLOCKS; i++) {
+            const uint32_t freeHeap = ESP.getFreeHeap();
+            // getMaxFreeBlockSize() zählt den 4-B-Kopf mit (umm_info.c:197-198)
+            const uint32_t largest = ESP.getMaxFreeBlockSize();
+            if (freeHeap <= 2 * FLASH_SECTOR_SIZE || largest < 16) break;
+            hold[i] = malloc(std::min<size_t>(freeHeap - 2 * FLASH_SECTOR_SIZE, largest - 8));
+            if (!hold[i]) break;
+        }
+    }
+    const uint32_t held = ESP.getFreeHeap();
+    const bool ok = Update.begin(size, command);
+    const uint32_t taken = held - ESP.getFreeHeap();
+    for (uint8_t i = UPDATER_HOLD_BLOCKS; i-- > 0;) free(hold[i]);
+    const uint32_t after = ESP.getFreeHeap();
+    noteHeap(r);
+    logLine("%s: Update.begin(%u B), Heap %u -> %u B, Flash-Puffer %s", fetchName(r.fetch), size, before, after,
+            !ok ? "-" : taken >= FLASH_SECTOR_SIZE ? "4096 B" : "256 B");
+    if (!ok) {
+        setError("Update.begin failed: %s", Update.getErrorString().c_str());
+        return false;
+    }
+    if (after < UPDATER_HEAP_RESERVE_AFTER) {
+        // Nur möglich, wenn der Heap so zerstückelt war, dass die Blöcke ihn nicht unter
+        // 8193 B drücken konnten, und der Updater doch 4 kB nahm
+        setError("only %u B heap left after Update.begin (%u B flash buffer), needed %u B - aborted", after,
+                 taken >= FLASH_SECTOR_SIZE ? FLASH_SECTOR_SIZE : UPDATER_SMALL_BUFFER, UPDATER_HEAP_RESERVE_AFTER);
+        return false;
+    }
+    return true;
+}
+
+// Erste Bytes eines Assets (data/len, mindestens LFS_SUPERBLOCK_MIN_LEN, außer das Asset ist
+// kürzer): alles, was das Image ablehnen kann, läuft vor Update.begin(), also vor dem ersten
+// Flash-Erase (für littlefs.bin auch vor dem Aushängen des Dateisystems).
+static bool beginFlash(RunContext &r, const Asset &a, const uint8_t *data, size_t len) {
     if (Update.isRunning()) {
         setError("another update is already in progress");
         return false;
     }
     const bool fs = r.fetch == Fetch::Filesystem;
     if (!fs) {
-        if (!otaHasFirmwareMagic(r.chunk, r.fill)) {
+        if (!otaHasFirmwareMagic(data, len)) {
             setError("firmware.bin is not an ESP8266 firmware image (magic byte 0xE9 missing)");
             return false;
         }
     } else {
         uint32_t imageSize = 0;
         char err[128];
-        if (!otaCheckLittleFsImage(r.chunk, r.fill, imageSize, err, sizeof(err))) {
+        if (!otaCheckLittleFsImage(data, len, imageSize, err, sizeof(err))) {
             setError("littlefs.bin: %s", err);
             return false;
         }
@@ -1420,34 +1919,38 @@ static bool beginFlash(RunContext &r, const Asset &a) {
     Update.runAsync(false);
     if (fs) {
         // Wie beim Datei-Upload: aushängen, damit kein offener File-Handle oder
-        // LittleFS-Cache in den Bereich schreibt, der gerade ersetzt wird.
+        // LittleFS-Cache in den Bereich schreibt, der gerade ersetzt wird. Gibt die Caches von
+        // lfs_mount() frei (3 x 64 B, LittleFS.h:73-74, lfs.c:3937-3966, ~216 B mit Verschnitt) -
+        // erst nach dem Handshake dieses Fetches, und der Firmware-Fetch davor braucht dasselbe
+        // bei eingehängtem Dateisystem. Früher aushängen verschöbe den kritischen Punkt also
+        // nicht; es nähme nur der Web-UI und saveConfig() das Dateisystem.
         close_all_fs();
         r.fsTouched = true;
     }
-    logLine("%s: Update.begin(%u B), Heap %u B", fetchName(r.fetch), a.size, ESP.getFreeHeap());
     // Vor dem Aufruf: begin() schaltet auf NONE_SLEEP (Updater.cpp:112) und kann danach
     // noch scheitern (UPDATE_ERROR_SPACE ab Zeile 135) - failRun() stellt dann zurück
     r.sleepForced = true;
     // Exakte Größe aus dem Manifest: ein abgeschnittener Download scheitert am
     // strikten Update.end(), statt ein halbes Image vorzumerken.
-    if (!Update.begin(a.size, fs ? U_FS : U_FLASH)) {
-        setError("Update.begin failed: %s", Update.getErrorString().c_str());
-        return false;
-    }
-    r.updateStarted = true;
+    const bool begun = beginUpdater(r, a.size, fs ? U_FS : U_FLASH);
+    // Auch wenn danach die Reserve fehlt: der Updater läuft, failRun() muss ihn zurücksetzen
+    r.updateStarted = Update.isRunning();
+    if (!begun) return false;
     if (fs) r.fsWritten = true;
     setState(FwUpdateState::Flashing);
     return true;
 }
 
-// Verarbeitet einen vollen Chunk. Der SHA-256 wird geprüft, BEVOR der letzte
-// Chunk geschrieben wird: solange noch Bytes fehlen, setzt Update.end() den
-// Updater nur zurück. Wäre alles geschrieben, würde end() das Image bei einem
+// Verarbeitet ein Stück Body (direkt aus dem Empfangspuffer bzw. head). Der SHA-256 wird
+// geprüft, BEVOR das letzte Stück geschrieben wird: solange noch Bytes fehlen, setzt
+// Update.end() den Updater nur zurück. Wäre alles geschrieben, würde end() das Image bei einem
 // Mismatch trotzdem vormerken (eboot-Kommando) - daher dieser Rückhalt.
-static Step processChunk(RunContext &r, const Asset &a) {
-    if (!r.updateStarted && !beginFlash(r, a)) return Step::Failed;
-    br_sha256_update(&r.sha, r.chunk, r.fill);
-    const bool last = r.received + r.fill == a.size;
+// Finished = Asset vollständig und verifiziert; onAssetDone() ruft der Aufrufer, nachdem er
+// den Record freigegeben hat (onAssetDone schließt die Verbindung).
+static Step processSpan(RunContext &r, const Asset &a, const uint8_t *data, size_t len) {
+    if (!r.updateStarted && !beginFlash(r, a, data, len)) return Step::Failed;
+    br_sha256_update(&r.sha, data, len);
+    const bool last = r.received + len == a.size;
     if (last) {
         uint8_t digest[SHA256_LEN];
         br_sha256_out(&r.sha, digest);
@@ -1456,44 +1959,68 @@ static Step processChunk(RunContext &r, const Asset &a) {
             return Step::Failed;
         }
     }
-    if (Update.write(r.chunk, r.fill) != r.fill) {
+    // write() liest data nur (memcpy in den eigenen Puffer, Updater.cpp:436-466)
+    if (Update.write(const_cast<uint8_t *>(data), len) != len) {
         setError("%s: flash write failed at %u bytes: %s", fetchName(r.fetch), r.received, Update.getErrorString().c_str());
         return Step::Failed;
     }
-    r.received += r.fill;
-    s_bytesDone += r.fill;
+    r.received += len;
+    s_bytesDone += len;
     if (r.received >= r.nextLogAt) {
         // Alle 64 kB eine Zeile: Fortschritt und Heap während Flash-Schreiben und TLS
         logLine("%s: %u/%u B, Heap %u B", fetchName(r.fetch), r.received, a.size, ESP.getFreeHeap());
         r.nextLogAt = r.received + 65536;
     }
-    r.fill = 0;
     if (!last) return Step::Continue;
     if (!Update.end(false)) {
         setError("%s: update verification failed: %s", fetchName(r.fetch), Update.getErrorString().c_str());
         return Step::Failed;
     }
     r.updateStarted = false;
-    return onAssetDone(r);
+    return Step::Finished;
+}
+
+// Manifest: Body in den Pfad-Puffer (nach dem 200 frei, MANIFEST_MAX_LEN passt hinein).
+static Step readManifestBody(RunContext &r) {
+    while (r.fill < r.bodyEnd) {
+        const uint8_t *data;
+        const int n = peekBody(r, data, r.bodyEnd - r.fill, r.bodyEnd);
+        if (n <= 0) return n < 0 ? Step::Failed : Step::Continue;
+        memcpy(r.path + r.fill, data, n);
+        r.fill += n;
+        r.client->peekConsume(n);
+    }
+    return onManifest(r);
 }
 
 static Step stepBody(RunContext &r) {
-    if (r.fetch == Fetch::Manifest) {
-        Step s = fillChunk(r, r.bodyEnd, r.bodyEnd);
-        return s == Step::Finished ? onManifest(r) : s;
-    }
+    if (r.fetch == Fetch::Manifest) return readManifestBody(r);
     const Asset &a = r.fetch == Fetch::Firmware ? r.firmware : r.filesystem;
     const unsigned long start = millis();
     while (millis() - start < TICK_BUDGET_MS) {
         if (r.received == r.bodyEnd) return nextRange(r);
-        // Chunks enden an Range-Grenzen (4096 ist kein Vielfaches von 1460);
-        // Update.write() nimmt jede Länge, nur der erste Chunk muss >= 32 B sein.
-        const size_t want = std::min<uint32_t>(CHUNK_LEN, r.bodyEnd - r.received);
-        Step s = fillChunk(r, want, a.size);
-        if (s != Step::Finished) return s;
-        s = processChunk(r, a);
-        // Asset fertig (nächster Fetch, Neustart) oder Fehler: nicht weiterlesen
-        if (s != Step::Continue || r.phase != Phase::Body) return s;
+        const uint8_t *data;
+        // r.fill: schon in head gesammelt, noch nicht in received
+        const int n = peekBody(r, data, r.bodyEnd - r.received - r.fill, a.size);
+        if (n <= 0) return n < 0 ? Step::Failed : Step::Continue;
+        Step s;
+        if (!r.updateStarted) {
+            // Anfang des Assets erst sammeln: die Bildprüfung braucht LFS_SUPERBLOCK_MIN_LEN B
+            // am Stück, ein Record kann kürzer sein
+            const size_t take = std::min<size_t>(n, sizeof(r.head) - r.fill);
+            memcpy(r.head + r.fill, data, take);
+            r.fill += take;
+            r.client->peekConsume(take);
+            if (r.fill < sizeof(r.head) && r.received + r.fill < r.bodyEnd) continue;
+            s = processSpan(r, a, r.head, r.fill);
+            r.fill = 0;
+        } else {
+            s = processSpan(r, a, data, n);
+            r.client->peekConsume(n);
+        }
+        noteHeap(r);
+        if (s == Step::Finished) return onAssetDone(r);
+        if (s != Step::Continue) return s;
     }
     return Step::Continue;
 }
@@ -1566,9 +2093,16 @@ static bool startRun(Job job, FwUpdateTarget target, const char *expectedVersion
     strlcpy(s_version, expectedVersion ? expectedVersion : "", sizeof(s_version));
     s_bytesDone = 0;
     s_bytesTotal = 0;
-    logLine("Start %s (v%s), Heap %u B, größter Block %u B; pro TLS-Verbindung %u B + Reserve %u B",
+    const uint32_t socket = tlsSocketBytes(stack_thunk_get_refcnt() == 0);
+    const uint32_t manifestConn = socket + tlsSessionBytes(TLS_RX_MANIFEST);
+    const uint32_t manifestNeed = tlsNeedBytes(TLS_RX_MANIFEST, socket, 0);
+    const uint32_t assetConn = socket + tlsSessionBytes(TLS_RX_ASSET);
+    const uint32_t assetNeed = tlsNeedBytes(TLS_RX_ASSET, socket, UPDATER_BUFFER_BYTES);
+    logLine("Start %s (v%s), Heap %u B, größter Block %u B; Bedarf Manifest %u B (Verbindung %u + Reserve %u), "
+            "Asset %u B (Verbindung %u + Flash-Puffer %u + Reserve %u)",
             job == Job::Check ? "check" : "install", FIRMWARE_VERSION, r->minHeap, ESP.getMaxFreeBlockSize(),
-            tlsSocketBytes(stack_thunk_get_refcnt() == 0) + tlsSessionBytes(), TLS_HEAP_RESERVE);
+            manifestNeed, manifestConn, manifestNeed - manifestConn, assetNeed, assetConn, UPDATER_BUFFER_BYTES,
+            assetNeed - assetConn - UPDATER_BUFFER_BYTES);
     setState(FwUpdateState::Checking);
     startFetch(*r, Fetch::Manifest); // MANIFEST_URL ist gültig, kann nicht scheitern
     return true;
@@ -1604,8 +2138,8 @@ bool firmwareUpdateRequestAbort() {
 void firmwareUpdateLoop() {
     RunContext *r = s_run;
     if (!r) return;
-    const uint32_t heap = ESP.getFreeHeap();
-    if (heap < r->minHeap) r->minHeap = heap;
+    noteHeap(*r);
+    if (r->webHold && webMayRun(*r)) holdWeb(*r, false);
     Step s;
     if (s_abortRequested) {
         s = Step::Failed;
@@ -1615,6 +2149,7 @@ void firmwareUpdateLoop() {
             case Phase::Tcp: s = stepTcp(*r); break;
             case Phase::Tls: s = stepTls(*r); break;
             case Phase::Headers: s = stepHeaders(*r); break;
+            case Phase::Request: s = stepRequest(*r); break;
             default: s = stepBody(*r); break;
         }
     }

@@ -19,3 +19,10 @@ void webServerLoop();
 // laufende HTTP-Antwort noch hinausgeht; loggt Reboot bzw. FactoryReset.
 // Öffentlich für firmware_update.cpp (Neustart nach einem Update von GitHub).
 void webServerScheduleReboot(bool factoryReset);
+
+// Für die Webserver-Pause des Updates von GitHub (firmware_update.cpp):
+// Offene HTTP-Verbindungen samt angenommener Handshakes (SYN_RCVD), ohne den wartenden
+// install-Request - dessen Heap ist schon belegt und wächst bis zur Antwort nicht mehr.
+uint8_t webServerOpenConnections();
+// Setzt das Verbindungslimit sofort statt erst im nächsten webServerLoop().
+void webServerApplyConnectionLimit();

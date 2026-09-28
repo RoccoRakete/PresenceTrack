@@ -5,6 +5,8 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <lwip/tcp.h> // TCP_SND_BUF
+#include "firmware_update.h"
 
 static WiFiClient s_wifiClient;
 static PubSubClient s_mqtt(s_wifiClient);
@@ -175,7 +177,14 @@ static void publishDiscovery() {
     s_discoveryPublished = true;
 }
 
-static void publishStates() {
+// Zustandswerte in der Reihenfolge, in der publishStates() sie schickt: presence, motion,
+// target_count, illuminance, dann je Zone zone_<i> und zone_<i>_motion.
+static const uint8_t STATE_ITEM_COUNT = 4 + 2 * MAX_ZONES;
+static const unsigned long PUBLISH_INTERVAL_MS = 2000;
+
+// Schickt Zustandswert idx; false, wenn er nicht gemeldet wird (Entität aus, Zone leer
+// oder aus, BH1750 ohne gültigen Wert).
+static bool publishStateItem(uint8_t idx) {
     const Ld2450State &ld = g_sensorState.ld2450;
     const Bh1750State &bh = g_sensorState.bh1750;
     const HaExposeConfig &ha = s_cfg.haExpose;
@@ -183,33 +192,114 @@ static void publishStates() {
     char topicBuf[TOPIC_BUF_LEN];
     char valueBuf[16];
 
-    if (ha.presence) {
-        s_mqtt.publish(topic("presence", topicBuf, sizeof(topicBuf)), ld.presence ? "ON" : "OFF", true);
-    }
-    if (ha.motion) {
-        s_mqtt.publish(topic("motion", topicBuf, sizeof(topicBuf)), ld.motion ? "ON" : "OFF", true);
-    }
-    if (ha.targetCount) {
-        snprintf(valueBuf, sizeof(valueBuf), "%d", ld.targetCount);
-        s_mqtt.publish(topic("target_count", topicBuf, sizeof(topicBuf)), valueBuf, true);
-    }
-    if (ha.illuminance && bh.valid) {
-        snprintf(valueBuf, sizeof(valueBuf), "%.1f", bh.lux);
-        s_mqtt.publish(topic("illuminance", topicBuf, sizeof(topicBuf)), valueBuf, true);
+    switch (idx) {
+        case 0:
+            if (!ha.presence) return false;
+            s_mqtt.publish(topic("presence", topicBuf, sizeof(topicBuf)), ld.presence ? "ON" : "OFF", true);
+            return true;
+        case 1:
+            if (!ha.motion) return false;
+            s_mqtt.publish(topic("motion", topicBuf, sizeof(topicBuf)), ld.motion ? "ON" : "OFF", true);
+            return true;
+        case 2:
+            if (!ha.targetCount) return false;
+            snprintf(valueBuf, sizeof(valueBuf), "%d", ld.targetCount);
+            s_mqtt.publish(topic("target_count", topicBuf, sizeof(topicBuf)), valueBuf, true);
+            return true;
+        case 3:
+            if (!ha.illuminance || !bh.valid) return false;
+            snprintf(valueBuf, sizeof(valueBuf), "%.1f", bh.lux);
+            s_mqtt.publish(topic("illuminance", topicBuf, sizeof(topicBuf)), valueBuf, true);
+            return true;
     }
 
-    for (uint8_t i = 0; i < MAX_ZONES; i++) {
-        if (!s_cfg.zones[i].present || !s_cfg.zones[i].enabled) continue;
-        char suffix[24];
+    const uint8_t i = (idx - 4) / 2;
+    if (i >= MAX_ZONES || !s_cfg.zones[i].present || !s_cfg.zones[i].enabled) return false;
+    char suffix[24];
+    if ((idx - 4) % 2 == 0) {
         snprintf(suffix, sizeof(suffix), "zone_%u", i);
         s_mqtt.publish(topic(suffix, topicBuf, sizeof(topicBuf)), ld.zonePresence[i] ? "ON" : "OFF", true);
-        if (ha.zoneMotion) {
-            snprintf(suffix, sizeof(suffix), "zone_%u_motion", i);
-            s_mqtt.publish(topic(suffix, topicBuf, sizeof(topicBuf)), ld.zoneMoving[i] ? "ON" : "OFF", true);
-        }
+        return true;
     }
+    if (!ha.zoneMotion) return false;
+    snprintf(suffix, sizeof(suffix), "zone_%u_motion", i);
+    s_mqtt.publish(topic(suffix, topicBuf, sizeof(topicBuf)), ld.zoneMoving[i] ? "ON" : "OFF", true);
+    return true;
 }
 
+static void publishStates() {
+    for (uint8_t i = 0; i < STATE_ITEM_COUNT; i++) publishStateItem(i);
+}
+
+// ---------------------------------------------------------------------------
+// Während eines Updates von GitHub (firmwareUpdateBusy())
+//
+// Die TLS-Verbindung des Updates braucht fast den ganzen Heap (firmware_update.cpp,
+// Kopfkommentar Speicher). Die Verbindung zum Broker bleibt, und die Zustände gehen
+// weiter hinaus, nur sparsamer:
+//   - PubSubClient-Puffer 256 statt 1024 B (+768 B frei). Reicht für jedes Zustands-PUBLISH
+//     und für ein CONNECT (Reconnect), nicht für Discovery - die wartet bis nach dem Lauf,
+//     Home Assistant hat sie retained vom Broker.
+//   - Gepaced: derselbe Durchgang wie publishStates() alle 2 s, aber ein Wert pro loop()
+//     und nur, wenn der vorige bestätigt ist (tcp_sndbuf == TCP_SND_BUF). So ist höchstens
+//     ein PUBLISH unbestätigt statt bis zu 16 (bis TCP_SND_BUF = 1072 B).
+//   - TCP_NODELAY: lwIP legt jedes Segment genau passend an statt MSS-groß (TCP_OVERSIZE,
+//     lwipopts.h:1432) - auch das PINGREQ, das PubSubClient::loop() selbst schickt.
+// Die Anwesenheitsmeldungen kostet das nur die Pacing-Latenz: 16 Werte brauchen 16 ACKs,
+// im LAN Millisekunden; während eines TLS-Handshakes (bis 15 s) ruht loop() ohnehin.
+// ---------------------------------------------------------------------------
+
+static const uint16_t MQTT_BUFFER_LEN = 1024;
+static const uint16_t MQTT_RUN_BUFFER_LEN = 256;
+// Geräte-Id "presencetrack_" + 6 Hex-Ziffern (deviceId(), ESP.getChipId() hat 24 Bit)
+static const size_t DEVICE_ID_LEN = 14 + 6;
+static const size_t TOPIC_MAX_LEN = (sizeof(MqttConfig::topicPrefix) - 1) + 1 + DEVICE_ID_LEN + 1 + strlen("zone_5_motion");
+static_assert(MAX_ZONES <= 10, "längster Zustands-Suffix ist zone_<eine Ziffer>_motion");
+static_assert(1 + 1 + 2 + TOPIC_MAX_LEN + 15 <= MQTT_STATE_PACKET_MAX && MQTT_STATE_PACKET_MAX < 128,
+              "MQTT_STATE_PACKET_MAX (mqtt_ha.h) nachführen");
+// PubSubClient::publish() braucht MQTT_MAX_HEADER_SIZE (5) + 2 + Topic + Wert im Puffer;
+// connect() 5 + 10 (Protokoll, Flags, Keepalive) + Client-Id, Will-Topic ("status"),
+// Will-Nachricht ("offline"), User und Passwort mit je 2 B Länge (PubSubClient.cpp:220-251).
+static_assert(5 + 2 + TOPIC_MAX_LEN + 15 <= MQTT_RUN_BUFFER_LEN &&
+                  5 + 10 + (2 + DEVICE_ID_LEN) +
+                          (2 + (sizeof(MqttConfig::topicPrefix) - 1) + 1 + DEVICE_ID_LEN + 1 + strlen("status")) +
+                          (2 + strlen("offline")) + (2 + sizeof(MqttConfig::user) - 1) +
+                          (2 + sizeof(MqttConfig::pass) - 1) <=
+                      MQTT_RUN_BUFFER_LEN,
+              "MQTT_RUN_BUFFER_LEN fasst ein Zustands-PUBLISH bzw. CONNECT nicht");
+
+static bool s_runMode = false;
+static uint8_t s_runItem = STATE_ITEM_COUNT; // nächster Wert des Durchgangs, COUNT = keiner offen
+
+static void syncRunMode() {
+    const bool busy = firmwareUpdateBusy();
+    if (busy == s_runMode) return;
+    if (busy) {
+        // Verkleinern: umm_realloc() teilt den Block an Ort und Stelle
+        s_mqtt.setBufferSize(MQTT_RUN_BUFFER_LEN);
+        s_runItem = STATE_ITEM_COUNT;
+        s_runMode = true;
+        return;
+    }
+    // Vergrößern kann an einem zerstückelten Heap scheitern; PubSubClient behält dann den
+    // kleinen Puffer (PubSubClient.cpp:740-755), der Lauf-Modus gilt weiter bis zum nächsten Versuch
+    if (!s_mqtt.setBufferSize(MQTT_BUFFER_LEN)) return;
+    s_wifiClient.setNoDelay(false);
+    s_runMode = false;
+}
+
+static void publishStatesPaced() {
+    if (s_runItem >= STATE_ITEM_COUNT) {
+        const unsigned long now = millis();
+        if (now - s_lastPublish <= PUBLISH_INTERVAL_MS) return;
+        s_lastPublish = now;
+        s_runItem = 0;
+    }
+    // Voriges PUBLISH (oder das PINGREQ) noch unbestätigt: nächster loop()
+    if (s_wifiClient.availableForWrite() != TCP_SND_BUF) return;
+    while (s_runItem < STATE_ITEM_COUNT && !publishStateItem(s_runItem++)) {
+    }
+}
 static bool reconnect() {
     if (!s_cfg.mqtt.enabled || strlen(s_cfg.mqtt.host) == 0) {
         return false;
@@ -237,7 +327,7 @@ static bool reconnect() {
 
 void mqttHaBegin(const AppConfig &cfg) {
     copyConfig(cfg);
-    s_mqtt.setBufferSize(1024);
+    s_mqtt.setBufferSize(MQTT_BUFFER_LEN);
 }
 
 void mqttHaApplyConfig(const AppConfig &cfg) {
@@ -251,6 +341,8 @@ void mqttHaApplyConfig(const AppConfig &cfg) {
 }
 
 void mqttHaLoop() {
+    // Vor dem enabled-Check: der Puffer ist auch ohne Broker belegt (mqttHaBegin)
+    syncRunMode();
     if (!s_cfg.mqtt.enabled || strlen(s_cfg.mqtt.host) == 0) {
         return;
     }
@@ -268,14 +360,22 @@ void mqttHaLoop() {
         return;
     }
 
+    // Nach einem Reconnect ist es ein neuer ClientContext (Default: Nagle an); vor loop(),
+    // damit auch dessen PINGREQ genau passend angelegt wird
+    if (s_runMode) s_wifiClient.setNoDelay(true);
     s_mqtt.loop();
+
+    if (s_runMode) {
+        publishStatesPaced();
+        return;
+    }
 
     if (!s_discoveryPublished) {
         publishDiscovery();
     }
 
     unsigned long now = millis();
-    if (now - s_lastPublish > 2000) {
+    if (now - s_lastPublish > PUBLISH_INTERVAL_MS) {
         s_lastPublish = now;
         publishStates();
     }

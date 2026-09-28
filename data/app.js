@@ -1270,9 +1270,11 @@ async function startOta() {
 // /api/update/status as `check` ("available"/"none"/"failed"/"aborted") once the device has
 // fetched manifest.json (three TLS handshakes on the ESP, typically a few seconds, a failing
 // hop gives up after at most 25 s). /install still answers only once the manifest is there -
-// no fetch timeout. While a run (check or install) is active the device accepts only 2 HTTP
-// connections (FW_UPDATE_HTTP_CONNECTIONS) and needs its heap for TLS: the regular polling
-// pauses (otaBusy), only the status is polled.
+// no fetch timeout. While a run (check or install) is active the device accepts only 1 HTTP
+// connection besides the waiting install request (FW_UPDATE_HTTP_CONNECTIONS), none while it
+// sets up a TLS connection or sends a request (the poll then waits for the TCP retransmit,
+// ~1-3 s), and needs its heap for TLS: the regular polling pauses (otaBusy), only the status
+// is polled.
 const GH_POLL_MS = 1000;
 const GH_POLL_MISSES_MAX = 10; // consecutive failed polls outside of the reboot
 const ghSec = { ind: 'gh-indicator' };

@@ -14,7 +14,7 @@
 // Öffentlicher Zustand, 1:1 als "state" in /api/update/status:
 //   Checking     Manifest wird geholt (GET /api/update/check oder Vorlauf eines Installs);
 //                ein check endet danach in Idle, sein Ergebnis steht in "check"
-//   Downloading  Verbindung/Redirects/Header eines Assets, erster Chunk wird geprüft
+//   Downloading  Verbindung/Redirects/Header eines Assets, erster Record wird geprüft
 //   Flashing     Update.begin() ist durch, die Bytes laufen in den Flash
 //   Rebooting    alles geschrieben und verifiziert, Neustart ist angesetzt
 enum class FwUpdateState : uint8_t { Idle, Checking, Downloading, Flashing, Rebooting, Error };
@@ -59,7 +59,7 @@ FwUpdateState firmwareUpdateState();
 bool firmwareUpdateBusy();
 
 // Startet einen Lauf. false, wenn schon einer läuft oder der Arbeitsspeicher für
-// den Lauf nicht reicht (~3 kB, siehe RunContext). expectedVersion darf
+// den Lauf nicht reicht (~1,8 kB, siehe RunContext). expectedVersion darf
 // nullptr/"" sein; sonst bricht der Install mit VersionMismatch ab, wenn das
 // Manifest inzwischen eine andere Version nennt.
 bool firmwareUpdateStartCheck();
@@ -84,11 +84,18 @@ bool firmwareUpdateParseTarget(const char *s, FwUpdateTarget &target);
 bool firmwareUpdateVersionValid(const char *s);
 
 // Während eines Laufs nimmt der Webserver nur so viele Verbindungen an (statt
-// MAX_HTTP_CONNECTIONS): eine TLS-Verbindung belegt ~16 kB Heap, und jede weitere
-// parallele Verbindung (~2 kB) kann dann ein `new` in der Library scheitern
-// lassen - ein Neustart mitten im Flash-Schreiben. 2 = eine für den Status-Poll
-// bzw. den wartenden install-Request, eine für den Abbruch.
-static const uint8_t FW_UPDATE_HTTP_CONNECTIONS = 2;
+// MAX_HTTP_CONNECTIONS), den wartenden install-Request nicht mitgezählt: eine
+// TLS-Verbindung belegt ~13,7 kB Heap, die Reserve daneben rechnet genau einen Poll
+// ein (RESERVE_WEB, 2692 B, firmware_update.cpp), und jede weitere parallele
+// Verbindung kann ein `new` in der Library scheitern lassen - ein Neustart mitten im
+// Flash-Schreiben. 1 = Status-Poll oder Abbruch; kommen beide zugleich, wartet einer
+// (lwIP verwirft das SYN, der Browser wiederholt es nach ~1 s).
+static const uint8_t FW_UPDATE_HTTP_CONNECTIONS = 1;
+
+// Aktuelles Limit während eines Laufs, für das Listen-Backlog in web_server.cpp: 0,
+// solange eine TLS-Verbindung aufgebaut wird oder ihr Request unterwegs ist
+// (Webserver-Pause, firmware_update.cpp), sonst FW_UPDATE_HTTP_CONNECTIONS.
+uint8_t firmwareUpdateHttpConnections();
 
 // /api/update/status als JSON nach buf, ohne Heap (der Status muss auch dann
 // antworten, wenn der TLS-Download den Heap fast aufbraucht). Liefert die Länge,
@@ -99,6 +106,6 @@ static const uint8_t FW_UPDATE_HTTP_CONNECTIONS = 2;
 //    error  bei state "error" und check "failed"/"aborted", sonst ""}
 // "check" beschreibt den letzten Lauf, wenn er ein check war; nach einem Install "".
 // FW_STATUS_JSON_MAX reicht immer: ~160 Zeichen Rahmen im Fehlerfall plus die
-// Meldung (bis 239 Zeichen), die notfalls gekürzt wird.
+// Meldung (bis 255 Zeichen), die notfalls gekürzt wird.
 static const size_t FW_STATUS_JSON_MAX = 416;
 size_t firmwareUpdateStatusToJson(char *buf, size_t size);

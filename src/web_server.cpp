@@ -39,10 +39,10 @@ static const uint8_t MAX_HTTP_CONNECTIONS = 4;
 
 static tcp_pcb_listen *s_httpListener = nullptr;
 
-// Setzt das Listen-Backlog so, dass lwIP nur noch so viele Handshakes annimmt,
-// wie Plätze frei sind (Handshakes im SYN_RCVD zählt lwIP selbst gegen das
-// Backlog, bei 0 werden alle SYNs verworfen).
-//
+// Wartender install-Request des Updates von GitHub (registerUpdateRoutes). Hier oben,
+// weil das Verbindungslimit ihn nicht mitzählt.
+static AsyncWebServerRequest *s_updateRequest = nullptr;
+
 // Gezählt werden nur Verbindungen, die noch einen AsyncClient haben (tcp_arg
 // gesetzt; ESPAsyncTCP löscht es beim Schließen). Die pcbs selbst leben nach
 // dem Schließen weiter, im FIN_WAIT_2 bis zu 20 s, wenn die Gegenseite ihr FIN
@@ -50,15 +50,33 @@ static tcp_pcb_listen *s_httpListener = nullptr;
 // nach 3 s Leerlauf schließt. Gemessen: vier solche Verbindungen blockierten
 // den Server mit lwIPs eigener Zählung (tcp_backlog_delayed) 20 s lang, obwohl
 // sie kaum noch Heap belegen.
-static void updateConnectionLimit() {
-    if (!s_httpListener) return;
+// Nicht mitgezählt: der wartende install-Request (tcp_arg ist sein AsyncClient) - sein
+// Heap ist belegt, bevor der Automat misst, und wächst bis zur Antwort nicht mehr.
+// withHandshakes: auch Handshakes im SYN_RCVD (noch ohne AsyncClient, gleich mit einem).
+static uint8_t countHttpConnections(bool withHandshakes) {
+    const void *held = s_updateRequest ? s_updateRequest->client() : nullptr;
     uint8_t open = 0;
     for (tcp_pcb *pcb = tcp_active_pcbs; pcb; pcb = pcb->next) {
-        if (pcb->local_port == HTTP_PORT && pcb->state != SYN_RCVD && pcb->callback_arg) open++;
+        if (pcb->local_port != HTTP_PORT) continue;
+        if (pcb->state == SYN_RCVD) {
+            if (withHandshakes) open++;
+        } else if (pcb->callback_arg && pcb->callback_arg != held) {
+            open++;
+        }
     }
+    return open;
+}
+
+// Setzt das Listen-Backlog so, dass lwIP nur noch so viele Handshakes annimmt,
+// wie Plätze frei sind (Handshakes im SYN_RCVD zählt lwIP selbst gegen das
+// Backlog, bei 0 werden alle SYNs verworfen).
+static void updateConnectionLimit() {
+    if (!s_httpListener) return;
+    const uint8_t open = countHttpConnections(false);
     // Während eines Updates von GitHub belegt TLS den Heap, den sonst die
-    // übrigen Verbindungen brauchen (siehe FW_UPDATE_HTTP_CONNECTIONS)
-    const uint8_t limit = firmwareUpdateBusy() ? FW_UPDATE_HTTP_CONNECTIONS : MAX_HTTP_CONNECTIONS;
+    // übrigen Verbindungen brauchen (siehe FW_UPDATE_HTTP_CONNECTIONS); 0 während
+    // der Webserver-Pause (firmwareUpdateHttpConnections)
+    const uint8_t limit = firmwareUpdateBusy() ? firmwareUpdateHttpConnections() : MAX_HTTP_CONNECTIONS;
     s_httpListener->backlog = open >= limit ? 0 : limit - open;
 }
 
@@ -1507,7 +1525,7 @@ static void registerOtaRoutes() {
 //                             filesystem_size], error} - Felder: firmware_update.h
 //
 // check wartet nicht mehr auf das Manifest: drei TLS-Handshakes dauern bis zu
-// 3 x (10 s TCP + 15 s TLS), und ein offener Request hielt einen der beiden
+// 3 x (10 s TCP + 15 s TLS), und ein offener Request hielt einen der
 // Verbindungsplätze eines Laufs (FW_UPDATE_HTTP_CONNECTIONS) samt Heap. Die UI
 // fragt ohnehin /api/update/status ab. Nur install antwortet weiterhin erst mit
 // dem Manifest (der Vertrag will 409 bei geänderter Version): der Request wartet
@@ -1523,8 +1541,6 @@ static void registerOtaRoutes() {
 // TLS-Handshake (typisch 1-2 s). Scheitert ein Hop an den Timeouts des Automaten
 // (bis 25 s), kommt die Fehlerantwort trotzdem noch vor diesen 60 s.
 static const uint8_t UPDATE_REQUEST_RX_TIMEOUT_S = 60;
-
-static AsyncWebServerRequest *s_updateRequest = nullptr;
 
 // /api/update/status ohne Heap außer dem Response-Objekt selbst: sendJsonDoc()
 // antwortet bei knappem Heap mit 503, der Status muss aber gerade während des
@@ -1852,6 +1868,14 @@ void webServerBegin(AppConfig &cfg) {
     }
     updateConnectionLimit();
     umm_free_heap_size_min_reset();
+}
+
+uint8_t webServerOpenConnections() {
+    return countHttpConnections(true);
+}
+
+void webServerApplyConnectionLimit() {
+    updateConnectionLimit();
 }
 
 void webServerLoop() {
