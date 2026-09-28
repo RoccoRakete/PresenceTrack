@@ -19,4 +19,8 @@
 // now only run through the web interface's file upload (/api/firmware,
 // /api/filesystem) or via USB (flash.sh). The config format is unchanged
 // (CONFIG_SCHEMA_VERSION stays the same).
-#define FIRMWARE_VERSION "0.4.0"
+//
+// 0.4.1: The Network/static-IP card moved from the MQTT tab to the System tab
+// in the web UI. Remaining German UI text has been translated to English. No
+// functional or config changes (CONFIG_SCHEMA_VERSION stays the same).
+#define FIRMWARE_VERSION "0.4.1"
