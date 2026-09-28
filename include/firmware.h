@@ -36,4 +36,11 @@
 // files together in a single file picker, classifying each by content
 // instead of by filename. No config changes (CONFIG_SCHEMA_VERSION stays
 // the same).
-#define FIRMWARE_VERSION "0.4.4"
+//
+// 0.4.5: The LD2450 now filters out short-lived multipath ghost targets via
+// a configurable minimum-existence time and max-jump-distance check. Also
+// fixes the web UI reloading before a device restart has actually completed,
+// which could leave a permanent stale "Restart required" indicator.
+// CONFIG_SCHEMA_VERSION bumped to 10 for the new ghost-filter fields (old
+// backups still load: they default to their built-in values).
+#define FIRMWARE_VERSION "0.4.5"
