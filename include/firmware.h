@@ -26,4 +26,9 @@
 //
 // 0.4.2: The BH1750 light sensor is now read over I2C instead of only being
 // simulated. No config changes (CONFIG_SCHEMA_VERSION stays the same).
-#define FIRMWARE_VERSION "0.4.2"
+//
+// 0.4.3: The LD2450 can now be given up to three hardware exclusion regions,
+// uploaded to the sensor itself over UART at boot. CONFIG_SCHEMA_VERSION
+// bumped to 9 for the new region_filter block (old backups still load: it
+// defaults to off, all slots unused).
+#define FIRMWARE_VERSION "0.4.3"
