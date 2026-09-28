@@ -140,10 +140,25 @@
     <label class="row"><span>Zone motion</span><input type="checkbox" id="ha-zone-motion" class="switch"></label>
     <p class="muted">Disabled entities are removed from Home Assistant. Zone occupancy entities follow the zone's own enabled switch. "Still" is occupancy on with motion off.</p>
   </div>
-  <div class="card" id="wifi-power-card">
-    <h2>Wi-Fi Connection Stability <span id="wifi-save-indicator" class="save-indicator"></span></h2>
+  <div class="card" id="network-card">
+    <h2>Network <span id="wifi-save-indicator" class="save-indicator"></span></h2>
     <label class="row"><span>Disable Wi-Fi power saving</span><input type="checkbox" id="wifi-no-sleep" class="switch"></label>
     <p class="muted">Some Wi-Fi chips briefly power down to save energy, which delays replies and can cause "Connection lost" messages. Disabling power saving fixes this at the cost of a slightly higher power draw – negligible for a permanently powered device.</p>
+    <label class="row"><span>Hostname</span><input type="text" id="wifi-hostname" maxlength="31" pattern="[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?" placeholder="presencetrack"></label>
+    <label class="row"><span>Static IP address</span><input type="checkbox" id="wifi-use-static-ip" class="switch"></label>
+    <div id="wifi-static-fields" hidden>
+      <label class="row"><span>IP address</span><input type="text" id="wifi-static-ip" maxlength="15" placeholder="192.168.1.50"></label>
+      <label class="row"><span>Gateway</span><input type="text" id="wifi-gateway" maxlength="15" placeholder="192.168.1.1"></label>
+      <label class="row"><span>Subnet mask</span><input type="text" id="wifi-subnet" maxlength="15" placeholder="255.255.255.0"></label>
+      <label class="row"><span>DNS server</span><input type="text" id="wifi-dns" maxlength="15" placeholder="same as gateway"></label>
+    </div>
+    <p class="muted warn" id="wifi-fallback-warn" hidden>The static IP did not work on the last boots (Wi-Fi or gateway unreachable), so the device is using DHCP. Correct the settings, or cycle the power to try the static IP again.</p>
+    <p class="muted">Hostname and IP settings take effect after a restart. If the static IP fails three boots in a row, the device falls back to DHCP.</p>
+    <div class="actions">
+      <button type="button" id="btn-wifi-reset" class="btn danger">Restart Wi-Fi setup</button>
+    </div>
+    <p class="muted">Forgets the Wi-Fi network and restarts. Connect to the Wi-Fi <code>PresenceTrack-Setup</code> afterwards to choose a network and enter its password.</p>
+    <div id="wifi-msg" class="muted"></div>
   </div>
 </section>
 
@@ -200,58 +215,58 @@
 <section class="tab-panel" id="tab-firmware">
   <div class="grid wide">
     <div class="card">
-      <h2>Installierte Firmware</h2>
-      <div class="row"><span>Firmware-Version</span><span id="fw-version">–</span></div>
-      <div class="row"><span>Sketch-Größe</span><span id="fw-sketch-size">–</span></div>
-      <div class="row"><span>Freier Sketch-Platz</span><span id="fw-free-sketch">–</span></div>
-      <div class="row"><span>Max. Firmware-Größe (OTA)</span><span id="fw-max-firmware">–</span></div>
-      <div class="row"><span>Dateisystem-Partition</span><span id="fw-fs-size">–</span></div>
-      <p class="muted">Firmware bauen: <code>pio run</code> → <code>.pio/build/d1_mini/firmware.bin</code>.
-        Dateisystem-Image (Web-Oberfläche aus <code>data/</code>) bauen: <code>pio run -t buildfs</code> → <code>.pio/build/d1_mini/littlefs.bin</code>.</p>
+      <h2>Installed Firmware</h2>
+      <div class="row"><span>Firmware version</span><span id="fw-version">–</span></div>
+      <div class="row"><span>Sketch size</span><span id="fw-sketch-size">–</span></div>
+      <div class="row"><span>Free sketch space</span><span id="fw-free-sketch">–</span></div>
+      <div class="row"><span>Max. firmware size (OTA)</span><span id="fw-max-firmware">–</span></div>
+      <div class="row"><span>Filesystem partition</span><span id="fw-fs-size">–</span></div>
+      <p class="muted">Build the firmware: <code>pio run</code> → <code>.pio/build/d1_mini/firmware.bin</code>.
+        Build the filesystem image (web UI from <code>data/</code>): <code>pio run -t buildfs</code> → <code>.pio/build/d1_mini/littlefs.bin</code>.</p>
     </div>
     <div class="card" id="gh-update-card">
-      <h2>Update von GitHub <span id="gh-indicator" class="save-indicator"></span></h2>
-      <p class="muted">Das Gerät holt das neueste Release von <code>github.com/RoccoRakete/PresenceTrack</code> selbst herunter
-        und schreibt es in den Flash – ohne PC und ohne Datei-Upload. Die Einstellungen bleiben erhalten.</p>
-      <div class="row"><span>Installiert</span><span id="gh-current">–</span></div>
-      <div class="row"><span>Verfügbar</span><span id="gh-available">–</span></div>
-      <div class="row"><span>Umfang</span>
+      <h2>Update from GitHub <span id="gh-indicator" class="save-indicator"></span></h2>
+      <p class="muted">The device downloads the latest release from <code>github.com/RoccoRakete/PresenceTrack</code> itself
+        and writes it to flash - no PC and no file upload needed. Settings are preserved.</p>
+      <div class="row"><span>Installed</span><span id="gh-current">–</span></div>
+      <div class="row"><span>Available</span><span id="gh-available">–</span></div>
+      <div class="row"><span>Scope</span>
         <select id="gh-target">
-          <option value="both">Firmware + Web-Oberfläche</option>
-          <option value="firmware">Nur Firmware</option>
+          <option value="both">Firmware + web UI</option>
+          <option value="firmware">Firmware only</option>
         </select></div>
       <progress id="gh-progress" class="ota-progress" max="1" value="0" hidden></progress>
       <div id="gh-msg" class="muted"></div>
       <div class="actions">
-        <button type="button" id="btn-gh-check" class="btn">Auf Update prüfen</button>
-        <button type="button" id="btn-gh-install" class="btn primary" disabled>Jetzt aktualisieren</button>
-        <button type="button" id="btn-gh-abort" class="btn danger" hidden>Abbrechen</button>
+        <button type="button" id="btn-gh-check" class="btn">Check for update</button>
+        <button type="button" id="btn-gh-install" class="btn primary" disabled>Update now</button>
+        <button type="button" id="btn-gh-abort" class="btn danger" hidden>Cancel</button>
       </div>
     </div>
     <div class="card" id="ota-card">
-      <h2>Update einspielen <span id="ota-indicator" class="save-indicator"></span></h2>
-      <p class="muted warn">Während des Updates und des anschließenden Neustarts ist das Gerät nicht erreichbar (ca. 1 Minute). Diese Seite geöffnet lassen.</p>
+      <h2>Upload Update <span id="ota-indicator" class="save-indicator"></span></h2>
+      <p class="muted warn">The device is unreachable during the update and the following restart (about 1 minute). Keep this page open.</p>
       <div class="row"><span>Firmware (firmware.bin)</span><input type="file" id="ota-fw-file" accept=".bin"></div>
       <div id="ota-fw-hint" class="muted"></div>
-      <div class="row"><span>Dateisystem-Image (littlefs.bin, optional)</span><input type="file" id="ota-fs-file" accept=".bin,.fs"></div>
+      <div class="row"><span>Filesystem image (littlefs.bin, optional)</span><input type="file" id="ota-fs-file" accept=".bin,.fs"></div>
       <div id="ota-fs-hint" class="muted"></div>
-      <p class="muted">Nur Firmware: Einstellungen bleiben erhalten, die Web-Oberfläche bleibt aber auf dem alten Stand.
-        Dateisystem-Image: ersetzt die Web-Oberfläche (index.html, app.js, style.css) und löscht dabei die gespeicherten Einstellungen –
-        sie werden nach dem Neustart automatisch aus dem Backup wiederhergestellt. Beides zusammen = vollständiges Release-Update.</p>
+      <p class="muted">Firmware only: settings are preserved, but the web UI stays at its old version.
+        Filesystem image: replaces the web UI (index.html, app.js, style.css) and erases the saved settings -
+        they are restored automatically from the backup after the restart. Both together = complete release update.</p>
       <ol id="ota-steps" class="ota-steps"></ol>
       <progress id="ota-progress" class="ota-progress" max="1" value="0" hidden></progress>
       <div id="ota-msg" class="muted"></div>
       <div class="actions">
-        <button type="button" id="btn-ota-start" class="btn primary">Update starten</button>
+        <button type="button" id="btn-ota-start" class="btn primary">Start update</button>
       </div>
     </div>
     <div class="card">
-      <h2>Backup wiederherstellen <span id="ota-restore-indicator" class="save-indicator"></span></h2>
-      <p class="muted">Vor jedem Update lädt der Browser automatisch ein Konfigurations-Backup herunter
-        (<code>presence-config-backup-&lt;Datum_Uhrzeit&gt;.json</code>, im Download-Ordner des Browsers).
-        Genau diese Datei lässt sich hier wieder einspielen (<code>/api/config/restore</code>) – sie ersetzt alle aktuellen Einstellungen.</p>
+      <h2>Restore Backup <span id="ota-restore-indicator" class="save-indicator"></span></h2>
+      <p class="muted">Before every update the browser automatically downloads a config backup
+        (<code>presencetrack-backup-&lt;date_time&gt;.json</code>, in the browser's download folder).
+        Exactly this file can be restored here (<code>/api/config/restore</code>) - it replaces all current settings.</p>
       <div class="actions">
-        <button type="button" id="btn-ota-restore" class="btn">Backup-Datei wählen…</button>
+        <button type="button" id="btn-ota-restore" class="btn">Restore from file…</button>
         <input type="file" id="ota-restore-input" accept="application/json,.json" hidden>
       </div>
     </div>

@@ -14,4 +14,10 @@
 // diese Version mit "version" aus manifest.json - weicht sie ab, bietet das
 // Gerät ein Release entweder endlos erneut an oder nie. Nur Ziffern und Punkte,
 // höchstens drei Segmente (firmwareUpdateVersionValid).
-#define FIRMWARE_VERSION "0.3.0"
+//
+// 0.3.1: Patch für das Update von GitHub in 0.3.0 (veröffentlicht und defekt). Der
+// check blockierte den Webserver-Request bis zum Manifest, DNS/TCP/TLS-Fehler kamen
+// als nichtssagendes "BearSSL error 0" an, und der Empfangspuffer hing vom Host ab.
+// Siehe Kopfkommentar in firmware_update.cpp. Das Konfigurationsformat ist
+// unverändert (CONFIG_SCHEMA_VERSION bleibt).
+#define FIRMWARE_VERSION "0.3.1"

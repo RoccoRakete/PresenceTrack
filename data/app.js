@@ -31,7 +31,7 @@ const BOARD_PINS = [[16, 'D0'], [5, 'D1'], [4, 'D2'], [0, 'D3'], [2, 'D4'], [14,
 const EVENT_LABELS = {
   presence_changed: 'Presence', zone_enter: 'Zone enter', zone_exit: 'Zone exit', mqtt_connected: 'MQTT',
   mqtt_disconnected: 'MQTT', config_changed: 'Config', reboot: 'System', factory_reset: 'Factory reset',
-  ota_update: 'Update'
+  ota_update: 'Update', network: 'Network'
 };
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -106,18 +106,20 @@ function renderPinWarnings(pins, warnings) {
     el.hidden = !msgs.length;
   });
 }
-function restartButton() {
+function restartButton(question) {
   const b = h('button', 'btn inline', 'Restart now');
   b.type = 'button';
-  b.addEventListener('click', () => deviceAction('/api/reboot', 'Reboot the device now to apply the new pins?', b.parentNode));
+  b.addEventListener('click', () => deviceAction('/api/reboot', question, b.parentNode));
   return b;
 }
-// Renders the pin status of a section response; returns true if the restart hint is shown.
-function applyPinStatus(sec, res, saved) {
-  if (!sec.pins || !res) return false;
-  renderPinWarnings(sec.pins, res.pin_warnings);
+// Renders the pin warnings and the restart hint of a section response (sections with
+// `pins` or a `restart` question); returns true if the restart hint is shown.
+function applyRestartStatus(sec, res, saved) {
+  if (!(sec.pins || sec.restart) || !res) return false;
+  if (sec.pins) renderPinWarnings(sec.pins, res.pin_warnings);
   if (!res.restart_required) return false;
-  setIndicator(sec, 'warn', saved ? 'Saved – restart required' : 'Restart required', restartButton());
+  const question = sec.restart || 'Reboot the device now to apply the new pins?';
+  setIndicator(sec, 'warn', saved ? 'Saved – restart required' : 'Restart required', restartButton(question));
   return true;
 }
 
@@ -630,12 +632,57 @@ function collectHaExpose() {
   return body;
 }
 
-// ---------- Wi-Fi power ----------
+// ---------- Network ----------
+// Same rules as the firmware validation (validateHostname/validateIp in web_server.cpp).
+const HOSTNAME_RE = /^[A-Za-z0-9]([A-Za-z0-9-]{0,29}[A-Za-z0-9])?$/;
+const IPV4_RE = /^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+function ipField(id, label, required) {
+  const v = $('#' + id).value.trim();
+  if (!v && !required) return '';
+  if (!IPV4_RE.test(v)) throw new Error(label + ': IPv4 address like 192.168.1.50');
+  return v;
+}
+function showStaticIpFields() {
+  $('#wifi-static-fields').hidden = !$('#wifi-use-static-ip').checked;
+}
 function renderWifi(c) {
   setChk('wifi-no-sleep', c.no_modem_sleep);
+  setVal('wifi-hostname', c.hostname);
+  setChk('wifi-use-static-ip', c.use_static_ip);
+  setVal('wifi-static-ip', c.static_ip);
+  setVal('wifi-gateway', c.gateway);
+  setVal('wifi-subnet', c.subnet);
+  setVal('wifi-dns', c.dns);
+  $('#wifi-fallback-warn').hidden = !c.static_ip_fallback;
+  showStaticIpFields();
 }
 function collectWifi() {
-  return { no_modem_sleep: $('#wifi-no-sleep').checked };
+  const hostname = $('#wifi-hostname').value.trim();
+  if (!HOSTNAME_RE.test(hostname)) throw new Error("Hostname: 1–31 of A–Z, a–z, 0–9 and '-', not at the start or end");
+  // With DHCP the address fields are optional and only kept for later
+  const req = $('#wifi-use-static-ip').checked;
+  return {
+    no_modem_sleep: $('#wifi-no-sleep').checked,
+    hostname,
+    use_static_ip: req,
+    static_ip: ipField('wifi-static-ip', 'IP address', req),
+    gateway: ipField('wifi-gateway', 'Gateway', req),
+    subnet: ipField('wifi-subnet', 'Subnet mask', req),
+    dns: ipField('wifi-dns', 'DNS server', false)
+  };
+}
+// Erases the stored Wi-Fi credentials; the device comes back as the setup AP, not on this network.
+async function resetWifiSetup() {
+  if (!confirm('Forget the Wi-Fi network and restart?\n\nThe device will not reconnect to this network. ' +
+    'Connect to the Wi-Fi "PresenceTrack-Setup" afterwards to set it up again.')) return;
+  const msg = $('#wifi-msg');
+  try {
+    await apiPost('/api/wifi/reset');
+    msg.textContent = 'Device is restarting. Connect to the Wi-Fi "PresenceTrack-Setup" to choose a network.';
+    $$('.actions button').forEach(b => { b.disabled = true; });
+  } catch (e) {
+    msg.textContent = 'Error: ' + e.message;
+  }
 }
 
 // ---------- Sections + auto-save ----------
@@ -652,7 +699,8 @@ const sections = {
   mqtt: { tab: 'mqtt', root: '#mqtt-card', path: '/api/config/mqtt', ind: 'mqtt-save-indicator', render: renderMqtt, collect: collectMqtt },
   haExpose: { tab: 'mqtt', root: '#ha-expose-card', path: '/api/config/ha-expose', ind: 'ha-expose-save-indicator',
     render: renderHaExpose, collect: collectHaExpose },
-  wifi: { tab: 'mqtt', root: '#wifi-power-card', path: '/api/config/wifi', ind: 'wifi-save-indicator', render: renderWifi, collect: collectWifi }
+  wifi: { tab: 'mqtt', root: '#network-card', path: '/api/config/wifi', ind: 'wifi-save-indicator', render: renderWifi, collect: collectWifi,
+    restart: 'Reboot the device now to apply the new network settings? It may come back under a new IP address.' }
 };
 
 // action: optional element (e.g. a button) appended after the message.
@@ -685,7 +733,7 @@ async function save(sec) {
       if (sec.kind === 'zone') zonesConfig = res; else objectsConfig = res;
       drawShapes(statusMap, zonesConfig, objectsConfig, lastPresence);
     }
-    if (!sec.again && !sec.timer && !applyPinStatus(sec, res, true)) setIndicator(sec, 'ok', 'Saved ✓');
+    if (!sec.again && !sec.timer && !applyRestartStatus(sec, res, true)) setIndicator(sec, 'ok', 'Saved ✓');
   } catch (e) {
     setIndicator(sec, 'err', 'Error: ' + e.message);
   }
@@ -700,7 +748,7 @@ async function loadSection(key) {
     const data = await apiGet(sec.path);
     if (!sec.timer && !sec.busy) {
       sec.render(data);
-      applyPinStatus(sec, data, false);
+      applyRestartStatus(sec, data, false);
     }
   } catch (e) {
     setIndicator(sec, 'err', 'Error: ' + e.message);
@@ -946,24 +994,21 @@ async function deviceAction(path, question, msg = $('#device-msg')) {
 // file client-side and POSTs its parsed content straight to /api/config/restore.
 const backupSec = { ind: 'backup-indicator' };
 const RESTORE_TEXT = {
-  en: { question: 'Restore this backup? It replaces all current settings (zones, objects, sensors, MQTT, pins) and cannot be undone.',
-    busy: 'Restoring…', done: 'Restored ✓ – reloading…', err: 'Error: ' },
-  de: { question: 'Dieses Backup wiederherstellen? Es ersetzt alle aktuellen Einstellungen (Zonen, Objekte, Sensoren, MQTT, Pins) und lässt sich nicht rückgängig machen.',
-    busy: 'Wird wiederhergestellt…', done: 'Wiederhergestellt ✓ – Seite wird neu geladen…', err: 'Fehler: ' }
+  question: 'Restore this backup? It replaces all current settings (zones, objects, sensors, MQTT, pins) and cannot be undone.',
+  busy: 'Restoring…', done: 'Restored ✓ – reloading…', err: 'Error: '
 };
-// sec/lang: the System tab (English) and the Firmware tab (German) share this.
-async function restoreBackupFile(file, sec = backupSec, lang = 'en') {
-  const t = RESTORE_TEXT[lang];
+// sec: indicator of the calling card - the System tab and the Firmware tab share this.
+async function restoreBackupFile(file, sec = backupSec) {
   if (!file || otaBusy) return; // never race the automatic restore of an OTA run
-  if (!confirm(t.question)) return;
-  setIndicator(sec, 'saving', t.busy);
+  if (!confirm(RESTORE_TEXT.question)) return;
+  setIndicator(sec, 'saving', RESTORE_TEXT.busy);
   try {
     const cfg = JSON.parse(await file.text());
     await apiPost('/api/config/restore', cfg);
-    setIndicator(sec, 'ok', t.done);
+    setIndicator(sec, 'ok', RESTORE_TEXT.done);
     setTimeout(() => location.reload(), 1500);
   } catch (e) {
-    setIndicator(sec, 'err', t.err + e.message);
+    setIndicator(sec, 'err', RESTORE_TEXT.err + e.message);
   }
 }
 
@@ -985,8 +1030,8 @@ const OTA_PROBE_TIMEOUT_MS = 3000;
 const OTA_UPLOAD_TIMEOUT_MS = 180000;
 const otaSec = { ind: 'ota-indicator' };
 const otaRestoreSec = { ind: 'ota-restore-indicator' };
-const OTA_STEPS = { backup: 'Konfigurations-Backup herunterladen', firmware: 'Firmware hochladen',
-  filesystem: 'Dateisystem-Image hochladen', reboot: 'Neustart abwarten', restore: 'Einstellungen wiederherstellen' };
+const OTA_STEPS = { backup: 'Download config backup', firmware: 'Upload firmware',
+  filesystem: 'Upload filesystem image', reboot: 'Wait for restart', restore: 'Restore settings' };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Both files are called *.bin, so they are easy to mix up: tell them apart by their
@@ -1004,19 +1049,19 @@ async function checkOtaFile(kind, file) {
   const type = await sniffOtaFile(file);
   const size = fmtBytes(file.size);
   if (kind === 'firmware') {
-    if (type !== 'firmware') return { ok: false, text: `${file.name}: keine ESP8266-Firmware${type === 'filesystem' ? ' (das ist ein Dateisystem-Image)' : ''}.` };
+    if (type !== 'firmware') return { ok: false, text: `${file.name}: not an ESP8266 firmware${type === 'filesystem' ? ' (this is a filesystem image)' : ''}.` };
     const max = systemInfo && systemInfo.ota_max_firmware_bytes;
-    if (!max) return { ok: true, text: `${file.name}: ${size} (Platz auf dem Gerät noch unbekannt).` };
+    if (!max) return { ok: true, text: `${file.name}: ${size} (free space on the device not known yet).` };
     return file.size <= max
-      ? { ok: true, text: `${file.name}: ${size} – passt (max. ${fmtBytes(max)}).` }
-      : { ok: false, text: `${file.name}: ${size} – zu groß, der OTA-Bereich fasst nur ${fmtBytes(max)}.` };
+      ? { ok: true, text: `${file.name}: ${size} - fits (max. ${fmtBytes(max)}).` }
+      : { ok: false, text: `${file.name}: ${size} - too large, the OTA space holds only ${fmtBytes(max)}.` };
   }
-  if (type !== 'filesystem') return { ok: false, text: `${file.name}: kein LittleFS-Image${type === 'firmware' ? ' (das ist eine Firmware-Datei)' : ''}.` };
+  if (type !== 'filesystem') return { ok: false, text: `${file.name}: not a LittleFS image${type === 'firmware' ? ' (this is a firmware file)' : ''}.` };
   const fsSize = systemInfo && systemInfo.fs_size_bytes;
-  if (!fsSize) return { ok: true, text: `${file.name}: ${size} (Partitionsgröße noch unbekannt).` };
+  if (!fsSize) return { ok: true, text: `${file.name}: ${size} (partition size not known yet).` };
   return file.size === fsSize
-    ? { ok: true, text: `${file.name}: ${size} – passt genau in die Dateisystem-Partition.` }
-    : { ok: false, text: `${file.name}: ${size} – passt nicht, die Partition ist ${fmtBytes(fsSize)} groß (anderes Flash-Layout?).` };
+    ? { ok: true, text: `${file.name}: ${size} - fits the filesystem partition exactly.` }
+    : { ok: false, text: `${file.name}: ${size} - does not fit, the partition is ${fmtBytes(fsSize)} (different flash layout?).` };
 }
 
 async function refreshOtaHint(kind) {
@@ -1036,7 +1081,7 @@ function setOtaStep(key, state, note) {
   const li = $(`#ota-steps li[data-step="${key}"]`);
   if (!li) return;
   li.className = state; // active | done | err | skip
-  li.textContent = OTA_STEPS[key] + (note ? ' – ' + note : '');
+  li.textContent = OTA_STEPS[key] + (note ? ' - ' + note : '');
 }
 function setOtaProgress(fraction) {
   const bar = $('#ota-progress');
@@ -1068,17 +1113,18 @@ async function downloadConfigBackup() {
   try {
     res = await fetch('/api/config/backup', { cache: 'no-store' });
   } catch (e) {
-    throw new Error('Gerät nicht erreichbar');
+    throw new Error('device not reachable');
   }
-  if (res.status !== 200) throw new Error('Gerät antwortet mit HTTP ' + res.status);
+  if (res.status !== 200) throw new Error('device answered with HTTP ' + res.status);
   const blob = await res.blob();
   let cfg;
   try { cfg = JSON.parse(await blob.text()); } catch (e) { cfg = null; }
-  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('Antwort ist kein gültiges Konfigurations-Backup');
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('response is not a valid config backup');
   const url = URL.createObjectURL(blob);
   const a = h('a');
   a.href = url;
-  a.download = `presence-config-backup-${backupTimestamp()}.json`;
+  // Same name scheme as the System tab's "Download backup" (same route), plus a timestamp
+  a.download = `presencetrack-backup-${backupTimestamp()}.json`;
   document.body.append(a);
   a.click();
   a.remove();
@@ -1105,8 +1151,8 @@ function otaUpload(path, file, reboot, onProgress) {
       err.fsDamaged = !!(data && data.filesystem_damaged);
       reject(err);
     };
-    xhr.onerror = () => reject(new Error('Verbindung zum Gerät unterbrochen'));
-    xhr.ontimeout = () => reject(new Error('Zeitüberschreitung beim Hochladen'));
+    xhr.onerror = () => reject(new Error('connection to the device lost'));
+    xhr.ontimeout = () => reject(new Error('upload timed out'));
     xhr.send(form);
   });
 }
@@ -1124,26 +1170,26 @@ async function waitForDevice() {
     } catch (e) { /* still rebooting */ } finally { clearTimeout(timer); }
     await sleep(OTA_POLL_INTERVAL_MS);
   }
-  throw new Error(`Gerät nach ${OTA_POLL_TIMEOUT_MS / 1000} s nicht erreichbar`);
+  throw new Error(`device not reachable after ${OTA_POLL_TIMEOUT_MS / 1000} s`);
 }
 
 async function startOta() {
   const fw = $('#ota-fw-file').files[0], fs = $('#ota-fs-file').files[0];
   const msg = $('#ota-msg');
   msg.classList.remove('warn');
-  if (!fw && !fs) { msg.textContent = 'Bitte eine Firmware- und/oder Image-Datei auswählen.'; return; }
+  if (!fw && !fs) { msg.textContent = 'Please choose a firmware and/or filesystem image file.'; return; }
   const checks = [fw && await refreshOtaHint('firmware'), fs && await refreshOtaHint('filesystem')].filter(Boolean);
   if (checks.some(c => !c.ok)) {
-    msg.textContent = 'Update nicht gestartet: ' + checks.filter(c => !c.ok).map(c => c.text).join(' ');
+    msg.textContent = 'Update not started: ' + checks.filter(c => !c.ok).map(c => c.text).join(' ');
     msg.classList.add('warn');
     return;
   }
-  const what = [fw && 'Firmware', fs && 'Dateisystem-Image'].filter(Boolean).join(' + ');
-  if (!confirm('Vor dem Update wird ein Konfigurations-Backup heruntergeladen. Fortfahren?\n\n' +
-    `Der Browser legt die Datei presence-config-backup-<Datum_Uhrzeit>.json in seinem Download-Ordner ab ` +
-    `(oder fragt nach dem Speicherort, je nach Browser-Einstellung).\n\n` +
-    `Danach wird ${what} hochgeladen; das Gerät startet neu und ist rund eine Minute nicht erreichbar.` +
-    (fs ? '\nDas Image löscht die gespeicherten Einstellungen – sie werden nach dem Neustart automatisch aus dem Backup wiederhergestellt.' : ''))) return;
+  const what = [fw && 'the firmware', fs && 'the filesystem image'].filter(Boolean).join(' + ');
+  if (!confirm('A config backup will be downloaded before the update. Continue?\n\n' +
+    `The browser saves the file presencetrack-backup-<date_time>.json to its download folder ` +
+    `(or asks for a location, depending on the browser settings).\n\n` +
+    `Then ${what} will be uploaded; the device restarts and is unreachable for about a minute.` +
+    (fs ? '\nThe image erases the saved settings - they are restored automatically from the backup after the restart.' : ''))) return;
 
   lockOta(true);
   const steps = ['backup', fw && 'firmware', fs && 'filesystem', 'reboot', 'restore'].filter(Boolean);
@@ -1151,10 +1197,10 @@ async function startOta() {
   msg.textContent = '';
   let step = 'backup';
   try {
-    setOtaStep(step, 'active', 'Backup wird erstellt…');
-    setIndicator(otaSec, 'saving', 'Update läuft…');
+    setOtaStep(step, 'active', 'creating backup…');
+    setIndicator(otaSec, 'saving', 'Updating…');
     const backup = await downloadConfigBackup();
-    setOtaStep(step, 'done', 'Download gestartet');
+    setOtaStep(step, 'done', 'download started');
 
     for (const [key, file, path, reboot] of [['firmware', fw, '/api/firmware', !fs], ['filesystem', fs, '/api/filesystem', true]]) {
       if (!file) continue;
@@ -1163,14 +1209,14 @@ async function startOta() {
       setOtaProgress(0);
       await otaUpload(path, file, reboot, f => {
         setOtaProgress(f);
-        setOtaStep(key, 'active', f < 1 ? Math.round(f * 100) + ' %' : 'wird geprüft…');
+        setOtaStep(key, 'active', f < 1 ? Math.round(f * 100) + ' %' : 'verifying…');
       });
       setOtaProgress(null);
       setOtaStep(step, 'done', fmtBytes(file.size));
     }
 
     step = 'reboot';
-    setOtaStep(step, 'active', 'Gerät startet neu…');
+    setOtaStep(step, 'active', 'device is restarting…');
     const info = await waitForDevice();
     setOtaStep(step, 'done', 'Version ' + orDash(info.fw_version));
 
@@ -1180,28 +1226,28 @@ async function startOta() {
       await apiPost('/api/config/restore', backup);
       setOtaStep(step, 'done');
     } else {
-      setOtaStep(step, 'skip', 'nicht nötig, ein Firmware-Update lässt die Einstellungen unverändert');
+      setOtaStep(step, 'skip', 'not needed, a firmware update keeps the settings');
     }
-    setIndicator(otaSec, 'ok', 'Fertig ✓');
+    setIndicator(otaSec, 'ok', 'Done ✓');
     // Reload: after an image the device serves the new index.html/app.js/style.css,
     // and a new firmware may come with an API this page does not know yet.
-    msg.textContent = 'Update abgeschlossen – Seite wird neu geladen…';
+    msg.textContent = 'Update complete - reloading…';
     setTimeout(() => { otaBusy = false; location.reload(); }, 3000); // no beforeunload prompt
   } catch (e) {
     setOtaProgress(null);
     setOtaStep(step, 'err', e.message);
-    setIndicator(otaSec, 'err', 'Fehlgeschlagen');
+    setIndicator(otaSec, 'err', 'Failed');
     msg.classList.add('warn');
     msg.textContent = {
-      backup: 'Backup fehlgeschlagen – das Update wurde NICHT gestartet. Gerät erreichbar?',
-      firmware: 'Firmware-Update fehlgeschlagen. Die laufende Firmware ist unverändert, das Gerät arbeitet normal weiter.',
+      backup: 'Backup failed - the update was NOT started. Is the device reachable?',
+      firmware: 'Firmware update failed. The running firmware is unchanged, the device keeps working normally.',
       filesystem: e.fsDamaged
-        ? 'Dateisystem-Update fehlgeschlagen, die Web-Dateien sind beschädigt. Gerät NICHT neu starten, sondern das Image sofort erneut hochladen.' +
-          (fw ? ' Die neue Firmware ist bereits vorgemerkt und wird mit dem nächsten Neustart aktiv.' : '')
-        : 'Dateisystem-Update abgelehnt, am Gerät wurde nichts verändert.' + (fw ? ' Die neue Firmware ist vorgemerkt und wird mit dem nächsten Neustart aktiv.' : ''),
-      reboot: 'Das Gerät meldet sich nach dem Neustart nicht (WLAN? Einrichtungsportal "PresenceTrack-Setup"?).' +
-        (fs ? ' Die Einstellungen danach über "Backup wiederherstellen" aus der heruntergeladenen Datei einspielen.' : ''),
-      restore: 'Automatische Wiederherstellung fehlgeschlagen. Die heruntergeladene Backup-Datei über "Backup wiederherstellen" einspielen.'
+        ? 'Filesystem update failed, the web files are damaged. Do NOT restart the device - upload the image again right away.' +
+          (fw ? ' The new firmware is already staged and becomes active with the next restart.' : '')
+        : 'Filesystem update rejected, nothing was changed on the device.' + (fw ? ' The new firmware is staged and becomes active with the next restart.' : ''),
+      reboot: 'The device does not respond after the restart (Wi-Fi? setup portal "PresenceTrack-Setup"?).' +
+        (fs ? ' Then restore the settings from the downloaded file via "Restore from file…".' : ''),
+      restore: 'Automatic restore failed. Restore the downloaded backup file via "Restore from file…".'
     }[step];
     lockOta(false);
   }
@@ -1212,20 +1258,25 @@ async function startOta() {
 // flash, reboot); this page only starts a run, polls /api/update/status and waits for the
 // reboot. No backup/restore round trip as in startOta(): the device writes its in-RAM config
 // into the fresh LittleFS image before it reboots.
-// /api/update/check and /install only answer once the device has fetched manifest.json
-// (three TLS handshakes on the ESP, typically a few seconds, up to ~30 s) - no fetch timeout.
-// While a run is active the device accepts only 2 HTTP connections (FW_UPDATE_HTTP_CONNECTIONS)
-// and needs its heap for TLS: the regular polling pauses (otaBusy), only the status is polled.
+// /api/update/check answers right away (202, state "checking"); the result arrives in
+// /api/update/status as `check` ("available"/"none"/"failed"/"aborted") once the device has
+// fetched manifest.json (three TLS handshakes on the ESP, typically a few seconds, a failing
+// hop gives up after at most 25 s). /install still answers only once the manifest is there -
+// no fetch timeout. While a run (check or install) is active the device accepts only 2 HTTP
+// connections (FW_UPDATE_HTTP_CONNECTIONS) and needs its heap for TLS: the regular polling
+// pauses (otaBusy), only the status is polled.
 const GH_POLL_MS = 1000;
 const GH_POLL_MISSES_MAX = 10; // consecutive failed polls outside of the reboot
 const ghSec = { ind: 'gh-indicator' };
-const GH_STATE_TEXT = { checking: 'Manifest wird geholt…', downloading: 'Verbindung zu GitHub…',
-  flashing: 'Wird geschrieben…', rebooting: 'Neustart…' };
-let ghAvailable = null; // last /api/update/check response with available === true
+const GH_STATE_TEXT = { checking: 'Fetching manifest…', downloading: 'Connecting to GitHub…',
+  flashing: 'Writing…', rebooting: 'Restarting…' };
+let ghAvailable = null; // {version, firmware_size, filesystem_size} of the last check with a newer release
+let ghMode = null;      // 'check' | 'install' while this page follows a run
 
-function ghLock(running) {
-  lockOta(running);
-  $('#btn-gh-abort').hidden = !running;
+function ghLock(mode) {
+  ghMode = mode;
+  lockOta(!!mode);
+  $('#btn-gh-abort').hidden = !mode;
 }
 
 function ghShowProgress(s) {
@@ -1233,7 +1284,7 @@ function ghShowProgress(s) {
   bar.hidden = !(s.bytes_total > 0);
   if (s.bytes_total > 0) bar.value = s.bytes_done / s.bytes_total;
   $('#gh-msg').textContent = (GH_STATE_TEXT[s.state] || s.state) + (s.bytes_total > 0
-    ? ` ${fmtBytes(s.bytes_done)} von ${fmtBytes(s.bytes_total)} (${Math.round(s.bytes_done * 100 / s.bytes_total)} %)` : '');
+    ? ` ${fmtBytes(s.bytes_done)} of ${fmtBytes(s.bytes_total)} (${Math.round(s.bytes_done * 100 / s.bytes_total)} %)` : '');
 }
 
 function ghFail(text) {
@@ -1241,51 +1292,99 @@ function ghFail(text) {
   $('#gh-progress').hidden = true;
   msg.textContent = text;
   msg.classList.add('warn');
-  setIndicator(ghSec, 'err', 'Fehlgeschlagen');
-  ghLock(false);
+  setIndicator(ghSec, 'err', 'Failed');
+  ghLock(null);
+}
+
+// One status poll; null if the device did not answer (lossy Wi-Fi: the caller retries).
+async function ghPollStatus() {
+  try {
+    const res = await fetch('/api/update/status', { cache: 'no-store' });
+    return await res.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+// Shows the outcome of a finished check (status fields, see firmware_update.h).
+function ghShowCheck(s) {
+  const msg = $('#gh-msg');
+  if (s.current_version) setText('gh-current', s.current_version);
+  if (s.check === 'available') {
+    ghAvailable = { version: s.available_version, firmware_size: s.firmware_size, filesystem_size: s.filesystem_size };
+    setText('gh-available',
+      `${s.available_version} (firmware ${fmtBytes(s.firmware_size)}, web UI ${fmtBytes(s.filesystem_size)})`);
+    msg.textContent = '';
+    setIndicator(ghSec, 'ok', 'Checked ✓');
+  } else if (s.check === 'none') {
+    ghAvailable = null;
+    setText('gh-available', 'no newer release');
+    msg.textContent = 'The installed version is up to date.';
+    setIndicator(ghSec, 'ok', 'Checked ✓');
+  } else {
+    ghAvailable = null;
+    msg.textContent = s.check === 'aborted' ? 'Check cancelled.' : 'Check failed: ' + (s.error || 'unknown error');
+    msg.classList.add('warn');
+    setIndicator(ghSec, s.check === 'aborted' ? 'warn' : 'err', s.check === 'aborted' ? 'Cancelled' : 'Error');
+  }
+}
+
+// Polls a running check until the device has its result, then shows it.
+async function ghWaitCheck(s) {
+  let misses = 0;
+  while (s.state === 'checking' && s.check === 'running') {
+    await sleep(GH_POLL_MS);
+    const next = await ghPollStatus();
+    if (!next) {
+      if (++misses >= GH_POLL_MISSES_MAX) throw new Error('the device no longer responds');
+      continue;
+    }
+    misses = 0;
+    s = next;
+  }
+  ghShowCheck(s);
 }
 
 async function ghCheck() {
   const msg = $('#gh-msg');
   msg.classList.remove('warn');
-  $('#btn-gh-check').disabled = true;
-  setIndicator(ghSec, 'saving', 'Prüfe…');
-  msg.textContent = 'Das Gerät fragt GitHub nach dem neuesten Release…';
+  ghLock('check');
+  setIndicator(ghSec, 'saving', 'Checking…');
+  msg.textContent = 'The device is asking GitHub for the latest release…';
   try {
     const r = await apiGet('/api/update/check');
-    ghAvailable = r.available ? r : null;
-    setText('gh-current', orDash(r.current_version));
-    setText('gh-available', r.available
-      ? `${r.version} (Firmware ${fmtBytes(r.firmware_size)}, Web-Oberfläche ${fmtBytes(r.filesystem_size)})`
-      : 'kein neueres Release');
-    msg.textContent = r.available ? '' : 'Die installierte Version ist aktuell.';
-    setIndicator(ghSec, 'ok', 'Geprüft ✓');
+    if ('available' in r) {
+      // Firmware up to 0.3.0 answered the check synchronously
+      ghShowCheck({ check: r.available ? 'available' : 'none', current_version: r.current_version,
+        available_version: r.version, firmware_size: r.firmware_size, filesystem_size: r.filesystem_size });
+    } else {
+      await ghWaitCheck(r); // 202: the device fetches the manifest now
+    }
   } catch (e) {
     ghAvailable = null;
-    msg.textContent = 'Prüfung fehlgeschlagen: ' + e.message;
+    msg.textContent = 'Check failed: ' + e.message;
     msg.classList.add('warn');
-    setIndicator(ghSec, 'err', 'Fehler');
+    setIndicator(ghSec, 'err', 'Error');
   }
-  $('#btn-gh-check').disabled = otaBusy;
-  $('#btn-gh-install').disabled = otaBusy || !ghAvailable;
+  ghLock(null);
 }
 
 async function ghInstall() {
   if (!ghAvailable || otaBusy) return;
   const target = $('#gh-target').value, version = ghAvailable.version;
-  if (!confirm(`Version ${version} von GitHub installieren (${target === 'both' ? 'Firmware + Web-Oberfläche' : 'nur Firmware'})?\n\n` +
-    'Das Gerät lädt das Update selbst herunter, prüft es und startet danach neu; es ist dabei rund eine Minute ' +
-    'nur eingeschränkt erreichbar. Die Einstellungen bleiben erhalten. Diese Seite geöffnet lassen.')) return;
+  if (!confirm(`Install version ${version} from GitHub (${target === 'both' ? 'firmware + web UI' : 'firmware only'})?\n\n` +
+    'The device downloads the update itself, verifies it and then restarts; it is only partly reachable ' +
+    'for about a minute. Settings are preserved. Keep this page open.')) return;
   const msg = $('#gh-msg');
   msg.classList.remove('warn');
-  ghLock(true);
-  setIndicator(ghSec, 'saving', 'Update läuft…');
-  msg.textContent = 'Manifest wird erneut geholt…';
+  ghLock('install');
+  setIndicator(ghSec, 'saving', 'Updating…');
+  msg.textContent = 'Fetching the manifest again…';
   try {
     // version: the device refuses (409) if the release changed since the check
     await apiPost('/api/update/install', { version, target });
   } catch (e) {
-    ghFail('Update nicht gestartet: ' + e.message);
+    ghFail('Update not started: ' + e.message);
     return;
   }
   ghFollow(target, version);
@@ -1297,78 +1396,90 @@ async function ghFollow(target, version) {
   let last = null, misses = 0;
   for (;;) {
     await sleep(GH_POLL_MS);
-    let s;
-    try {
-      const res = await fetch('/api/update/status', { cache: 'no-store' });
-      s = await res.json();
-      misses = 0;
-    } catch (e) {
+    const s = await ghPollStatus();
+    if (!s) {
       // The restart follows 300 ms after "rebooting", so the device may vanish before
       // a poll ever sees that state: a vanished device with everything written is the reboot.
       if (last && (last.state === 'rebooting' || (last.bytes_total > 0 && last.bytes_done >= last.bytes_total))) break;
-      if (++misses >= GH_POLL_MISSES_MAX) { ghFail('Das Gerät antwortet nicht mehr.'); return; }
+      if (++misses >= GH_POLL_MISSES_MAX) { ghFail('The device no longer responds.'); return; }
       continue;
     }
+    misses = 0;
     last = s;
     ghShowProgress(s);
     if (s.state === 'rebooting') break;
     if (s.state === 'error') {
-      ghFail(/^aborted/.test(s.error) ? 'Update abgebrochen.' + s.error.replace(/^aborted/, '') : 'Update fehlgeschlagen: ' + s.error);
+      ghFail(/^aborted/.test(s.error) ? 'Update cancelled.' + s.error.replace(/^aborted/, '') : 'Update failed: ' + s.error);
       return;
     }
-    if (s.state === 'idle') { ghFail('Update beendet, ohne etwas zu installieren.'); return; }
+    if (s.state === 'idle') { ghFail('Update ended without installing anything.'); return; }
   }
   $('#gh-progress').hidden = true;
-  msg.textContent = 'Update geschrieben – Gerät startet neu…';
+  msg.textContent = 'Update written - device is restarting…';
   try {
     const info = await waitForDevice();
     await loadSystem();
     if (info.fw_version !== version) {
-      ghFail(`Das Gerät läuft wieder, meldet aber Version ${orDash(info.fw_version)} statt ${version}.`);
+      ghFail(`The device is running again, but reports version ${orDash(info.fw_version)} instead of ${version}.`);
       return;
     }
     ghAvailable = null;
-    setText('gh-available', 'installiert');
-    setIndicator(ghSec, 'ok', 'Fertig ✓');
+    setText('gh-available', 'installed');
+    setIndicator(ghSec, 'ok', 'Done ✓');
     if (target === 'both') {
       // New index.html/app.js/style.css on the device: this page is outdated now
-      msg.textContent = `Version ${version} installiert – Seite wird neu geladen…`;
+      msg.textContent = `Version ${version} installed - reloading…`;
       setTimeout(() => { otaBusy = false; location.reload(); }, 3000); // no beforeunload prompt
       return;
     }
-    msg.textContent = `Version ${version} installiert.`;
-    ghLock(false);
+    msg.textContent = `Version ${version} installed.`;
+    ghLock(null);
   } catch (e) {
     ghFail(e.message);
   }
 }
 
+// Cancels the run this page follows; the loop of ghWaitCheck()/ghFollow() then sees the end.
 async function ghAbort() {
-  if (!confirm('Update abbrechen? Eine schon vorgemerkte Firmware bleibt vorgemerkt; ein halb geschriebenes ' +
-    'Dateisystem muss danach neu installiert werden (Gerät bis dahin nicht neu starten).')) return;
+  if (ghMode !== 'check' && !confirm('Cancel the update? A firmware that is already staged stays staged; a half-written ' +
+    'filesystem must be installed again afterwards (do not restart the device until then).')) return;
   try {
     await apiPost('/api/update/install', { abort: true });
-    $('#gh-msg').textContent = 'Wird abgebrochen…';
+    $('#gh-msg').textContent = 'Cancelling…';
   } catch (e) {
-    $('#gh-msg').textContent = 'Abbruch fehlgeschlagen: ' + e.message;
+    $('#gh-msg').textContent = 'Cancel failed: ' + e.message;
   }
 }
 
-// Opening the tab picks up a run that is already going (reload, second browser tab)
-// and shows the error of the last failed one.
+// Opening the tab picks up a run that is already going (reload, second browser tab),
+// shows the result of the last check and the error of the last failed update.
 async function ghResume() {
   if (otaBusy) return;
   try {
     const s = await apiGet('/api/update/status');
-    // "checking" without a target is a plain check, nothing to follow
+    // "checking" without a target is a plain check
     if (s.state === 'downloading' || s.state === 'flashing' || (s.state === 'checking' && s.target)) {
-      ghLock(true);
-      setIndicator(ghSec, 'saving', 'Update läuft…');
+      ghLock('install');
+      setIndicator(ghSec, 'saving', 'Updating…');
       ghShowProgress(s);
       ghFollow(s.target, s.version);
+    } else if (s.state === 'checking') {
+      ghLock('check');
+      setIndicator(ghSec, 'saving', 'Checking…');
+      $('#gh-msg').textContent = 'The device is asking GitHub for the latest release…';
+      try {
+        await ghWaitCheck(s);
+      } catch (e) {
+        $('#gh-msg').textContent = 'Check failed: ' + e.message;
+        $('#gh-msg').classList.add('warn');
+      }
+      ghLock(null);
     } else if (s.state === 'error') {
-      $('#gh-msg').textContent = 'Letztes Update fehlgeschlagen: ' + s.error;
+      $('#gh-msg').textContent = 'Last update failed: ' + s.error;
       $('#gh-msg').classList.add('warn');
+    } else if (s.check && s.check !== 'running') {
+      ghShowCheck(s);
+      $('#btn-gh-install').disabled = !ghAvailable;
     }
   } catch (e) { /* older firmware without /api/update: nothing to show */ }
 }
@@ -1395,6 +1506,9 @@ $('#btn-reboot').addEventListener('click', () =>
   deviceAction('/api/reboot', 'Reboot the device now?'));
 $('#btn-factory-reset').addEventListener('click', () =>
   deviceAction('/api/factory-reset', 'Reset all settings to factory defaults and reboot?'));
+$('#btn-wifi-reset').addEventListener('click', resetWifiSetup);
+// Show/hide before bindSection() saves the change
+$('#wifi-use-static-ip').addEventListener('change', showStaticIpFields);
 $('#btn-backup-restore').addEventListener('click', () => $('#backup-file-input').click());
 $('#backup-file-input').addEventListener('change', e => {
   restoreBackupFile(e.target.files[0]);
@@ -1402,7 +1516,7 @@ $('#backup-file-input').addEventListener('change', e => {
 });
 $('#btn-ota-restore').addEventListener('click', () => $('#ota-restore-input').click());
 $('#ota-restore-input').addEventListener('change', e => {
-  restoreBackupFile(e.target.files[0], otaRestoreSec, 'de');
+  restoreBackupFile(e.target.files[0], otaRestoreSec);
   e.target.value = '';
 });
 $('#ota-fw-file').addEventListener('change', () => refreshOtaHint('firmware'));
@@ -1412,13 +1526,14 @@ $('#btn-gh-check').addEventListener('click', ghCheck);
 $('#btn-gh-install').addEventListener('click', ghInstall);
 $('#btn-gh-abort').addEventListener('click', ghAbort);
 // Leaving mid-run would drop the upload and the automatic config restore.
-window.addEventListener('beforeunload', e => { if (otaBusy) e.preventDefault(); });
+// A running check can be left safely (it ends on its own), an update run cannot
+window.addEventListener('beforeunload', e => { if (otaBusy && ghMode !== 'check') e.preventDefault(); });
 window.addEventListener('resize', scaleMaps);
 scaleMaps();
 // Zone + object config is also needed for the status map and zone list.
-// Nacheinander statt parallel: das Gerät nimmt nur 4 Verbindungen gleichzeitig an
-// (web_server.cpp, MAX_HTTP_CONNECTIONS), jede weitere wartet ~1 s auf den
-// TCP-Retransmit - und jede parallele Antwort kostet Heap.
+// One after another instead of in parallel: the device accepts only 4 connections at
+// once (web_server.cpp, MAX_HTTP_CONNECTIONS), each additional one waits ~1 s for the
+// TCP retransmit - and every parallel response costs heap.
 (async () => {
   await loadSection('zones');
   await loadSection('objects');

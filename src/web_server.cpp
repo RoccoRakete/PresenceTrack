@@ -88,6 +88,7 @@ static AppConfig *s_cfg = nullptr;
 
 static bool s_rebootPending = false;
 static unsigned long s_rebootRequestedAt = 0;
+static bool s_wifiResetPending = false; // erase the Wi-Fi credentials right before the restart
 
 using JsonPostHandler = std::function<void(JsonDocument &, JsonDocument &, AsyncWebServerRequest *)>;
 
@@ -391,6 +392,35 @@ static bool validateString(JsonObjectConst obj, const char *key, size_t minLen, 
     return true;
 }
 
+// DHCP/DNS host label: 1-31 of [A-Za-z0-9-], no leading or trailing '-'.
+static bool validateHostname(JsonObjectConst obj, const char *key, String &err) {
+    JsonVariantConst v = obj[key];
+    if (v.isNull()) return true;
+    const char *s = v.is<const char *>() ? v.as<const char *>() : nullptr;
+    size_t n = s ? strlen(s) : 0;
+    bool ok = n >= 1 && n <= 31 && s[0] != '-' && s[n - 1] != '-';
+    for (size_t i = 0; ok && i < n; i++) {
+        ok = isalnum((unsigned char)s[i]) || s[i] == '-';
+    }
+    if (!ok) {
+        err = String(key) + " must be 1-31 characters of A-Z, a-z, 0-9 and '-', not starting or ending with '-'";
+    }
+    return ok;
+}
+
+// Dotted IPv4 address; "" is allowed (field unused with DHCP / optional DNS).
+static bool validateIp(JsonObjectConst obj, const char *key, String &err) {
+    JsonVariantConst v = obj[key];
+    if (v.isNull()) return true;
+    IPAddress ip;
+    if (!v.is<const char *>() || strlen(v.as<const char *>()) > 15 ||
+        (*v.as<const char *>() && !ip.fromString(v.as<const char *>()))) {
+        err = String(key) + " must be an IPv4 address like 192.168.1.50 or empty";
+        return false;
+    }
+    return true;
+}
+
 static bool requireObject(JsonDocument &body, AsyncWebServerRequest *request) {
     if (body.is<JsonObjectConst>()) return true;
     sendJsonError(request, 400, "body must be a JSON object");
@@ -534,8 +564,29 @@ static void haExposeToJson(const HaExposeConfig &c, JsonDocument &doc) {
     doc["zone_motion"] = c.zoneMotion;
 }
 
+// Network settings as the firmware booted with them: main.cpp applies them only
+// before autoConnect(), so any difference means the change takes effect after a restart.
+static WifiConfig s_bootWifi;
+// Static IP configured, but the device booted with DHCP (fallback in main.cpp).
+static bool s_staticIpFallback = false;
+
+static bool wifiNetworkChanged(const WifiConfig &a, const WifiConfig &b) {
+    return strcmp(a.hostname, b.hostname) != 0 || a.useStaticIp != b.useStaticIp ||
+           strcmp(a.staticIp, b.staticIp) != 0 || strcmp(a.gateway, b.gateway) != 0 ||
+           strcmp(a.subnet, b.subnet) != 0 || strcmp(a.dns, b.dns) != 0;
+}
+
 static void wifiToJson(const WifiConfig &c, JsonDocument &doc) {
     doc["no_modem_sleep"] = c.noModemSleep;
+    doc["hostname"] = c.hostname;
+    doc["use_static_ip"] = c.useStaticIp;
+    doc["static_ip"] = c.staticIp;
+    doc["gateway"] = c.gateway;
+    doc["subnet"] = c.subnet;
+    doc["dns"] = c.dns;
+    // Same key as the pin sections; no_modem_sleep switches live and never needs it
+    doc["restart_required"] = wifiNetworkChanged(c, s_bootWifi);
+    doc["static_ip_fallback"] = s_staticIpFallback;
 }
 
 static void zonesToJson(const ZoneConfig *zones, JsonDocument &doc) {
@@ -802,16 +853,53 @@ static void registerWifiRoutes() {
             JsonObjectConst o = body.as<JsonObjectConst>();
 
             String err;
-            if (!validateBool(o, "no_modem_sleep", err)) {
+            if (!validateBool(o, "no_modem_sleep", err) ||
+                !validateHostname(o, "hostname", err) ||
+                !validateBool(o, "use_static_ip", err) ||
+                !validateIp(o, "static_ip", err) ||
+                !validateIp(o, "gateway", err) ||
+                !validateIp(o, "subnet", err) ||
+                !validateIp(o, "dns", err)) {
                 sendJsonError(request, 400, err);
                 return;
             }
 
+            WifiConfig next = s_cfg->wifi;
+            next.noModemSleep = o["no_modem_sleep"] | next.noModemSleep;
+            strlcpy(next.hostname, o["hostname"] | next.hostname, sizeof(next.hostname));
+            next.useStaticIp = o["use_static_ip"] | next.useStaticIp;
+            strlcpy(next.staticIp, o["static_ip"] | next.staticIp, sizeof(next.staticIp));
+            strlcpy(next.gateway, o["gateway"] | next.gateway, sizeof(next.gateway));
+            strlcpy(next.subnet, o["subnet"] | next.subnet, sizeof(next.subnet));
+            strlcpy(next.dns, o["dns"] | next.dns, sizeof(next.dns));
+            // Checked on the merged values: a partial update may leave a required field empty
+            if (next.useStaticIp && (!*next.staticIp || !*next.gateway || !*next.subnet)) {
+                sendJsonError(request, 400, "static_ip, gateway and subnet are required when use_static_ip is true");
+                return;
+            }
+            if (next.useStaticIp) {
+                IPAddress ip, gw, sn;
+                ip.fromString(next.staticIp);
+                gw.fromString(next.gateway);
+                sn.fromString(next.subnet);
+                // IPAddress holds the octets in network order; ntohl for the bit tests
+                uint32_t mask = ntohl((uint32_t)sn);
+                if (mask == 0 || (~mask & (~mask + 1)) != 0) {
+                    sendJsonError(request, 400, "subnet must be a netmask like 255.255.255.0");
+                    return;
+                }
+                if (((uint32_t)ip & (uint32_t)sn) != ((uint32_t)gw & (uint32_t)sn) || ip == gw) {
+                    sendJsonError(request, 400, "static_ip and gateway must be different addresses in the same subnet");
+                    return;
+                }
+            }
+
             WifiConfig &c = s_cfg->wifi;
             WifiConfig previous = c;
-            c.noModemSleep = o["no_modem_sleep"] | c.noModemSleep;
+            c = next;
 
-            // No HA entities involved; the sleep mode switches at runtime without a reconnect
+            // No HA entities involved; the sleep mode switches at runtime without a reconnect,
+            // hostname/IP settings are applied on the next boot (restart_required)
             if (!persistAndApply(request, "wifi", false)) {
                 s_cfg->wifi = previous;
                 return;
@@ -1402,28 +1490,37 @@ static void registerOtaRoutes() {
 // ---------------------------------------------------------------------------
 // Update direkt von GitHub (Automat in firmware_update.cpp)
 //
-//   GET  /api/update/check    Manifest holen -> {current_version, available[, version,
-//                             firmware_size, filesystem_size]}
+//   GET  /api/update/check    startet nur den Lauf und antwortet sofort:
+//                             202 + Status-Objekt (state "checking", check "running").
+//                             Das Ergebnis steht danach in /api/update/status.
+//                             409 Neustart angesetzt / Datei-Upload läuft,
+//                             503 Lauf läuft schon / kein Heap für den Lauf.
 //   POST /api/update/install  {"version"?: "0.3.1", "target"?: "firmware"|"both"} -> 202
 //                             {state, version}; {"abort": true} bricht einen Lauf ab
-//   GET  /api/update/status   immer 200: {state, target, version, bytes_done, bytes_total, error}
+//                             (auch einen check): 202 + Status, 200 wenn keiner lief
+//   GET  /api/update/status   immer 200: {state, target, version, bytes_done, bytes_total,
+//                             check, current_version[, available_version, firmware_size,
+//                             filesystem_size], error} - Felder: firmware_update.h
 //
-// check und install antworten erst, wenn das Manifest da ist (der Vertrag will
-// check synchron und install mit 409 bei geänderter Version). Das TLS dafür
-// darf nicht im Request-Handler laufen - der läuft im lwIP-Kontext, wo yield()
-// panict -, sondern im Automaten aus webServerLoop(). Der Request wartet
-// deshalb in s_updateRequest und wird aus webServerLoop() beantwortet
-// (answerUpdateRequest); ESPAsyncTCP ist dafür nicht auf den Callback-Kontext
-// angewiesen, loop() und lwIP laufen auf dem ESP8266 nie gleichzeitig.
+// check wartet nicht mehr auf das Manifest: drei TLS-Handshakes dauern bis zu
+// 3 x (10 s TCP + 15 s TLS), und ein offener Request hielt einen der beiden
+// Verbindungsplätze eines Laufs (FW_UPDATE_HTTP_CONNECTIONS) samt Heap. Die UI
+// fragt ohnehin /api/update/status ab. Nur install antwortet weiterhin erst mit
+// dem Manifest (der Vertrag will 409 bei geänderter Version): der Request wartet
+// in s_updateRequest und wird aus webServerLoop() beantwortet (answerUpdateRequest);
+// ESPAsyncTCP ist dafür nicht auf den Callback-Kontext angewiesen, loop() und lwIP
+// laufen auf dem ESP8266 nie gleichzeitig. Das TLS selbst läuft nie im
+// Request-Handler (lwIP-Kontext, dort panict yield()), sondern im Automaten aus
+// webServerLoop().
 // ---------------------------------------------------------------------------
 
-// Wartezeit eines check/install-Requests auf das Manifest. Das RX-Timeout von 3 s
+// Wartezeit des install-Requests auf das Manifest. Das RX-Timeout von 3 s
 // (LimitedWebServer) würde ihn vorher schließen: drei Hops mit je einem
-// TLS-Handshake (1-2 s) plus ggf. einem zweiten Versuch ohne MFLN.
+// TLS-Handshake (typisch 1-2 s). Scheitert ein Hop an den Timeouts des Automaten
+// (bis 25 s), kommt die Fehlerantwort trotzdem noch vor diesen 60 s.
 static const uint8_t UPDATE_REQUEST_RX_TIMEOUT_S = 60;
 
 static AsyncWebServerRequest *s_updateRequest = nullptr;
-static bool s_updateRequestIsInstall = false;
 
 // /api/update/status ohne Heap außer dem Response-Objekt selbst: sendJsonDoc()
 // antwortet bei knappem Heap mit 503, der Status muss aber gerade während des
@@ -1473,16 +1570,15 @@ static bool updateStartAllowed(AsyncWebServerRequest *request) {
     return true;
 }
 
-static void holdUpdateRequest(AsyncWebServerRequest *request, bool install) {
+static void holdUpdateRequest(AsyncWebServerRequest *request) {
     s_updateRequest = request;
-    s_updateRequestIsInstall = install;
     request->client()->setRxTimeout(UPDATE_REQUEST_RX_TIMEOUT_S);
     // Geht der Client vorher, läuft der Automat trotzdem weiter (ein Install
     // wird über /api/update/status verfolgt); nur die Antwort entfällt.
     request->onDisconnect([]() { s_updateRequest = nullptr; });
 }
 
-// Aus webServerLoop(): beantwortet den wartenden Request, sobald das Manifest da ist.
+// Aus webServerLoop(): beantwortet den wartenden install-Request, sobald das Manifest da ist.
 static void answerUpdateRequest() {
     if (!s_updateRequest) return;
     FwManifestInfo info;
@@ -1493,7 +1589,6 @@ static void answerUpdateRequest() {
     AsyncWebServerRequest *request = s_updateRequest;
     s_updateRequest = nullptr;
     request->onDisconnect(nullptr); // sonst löscht das spätere Disconnect einen neuen s_updateRequest
-    const bool install = s_updateRequestIsInstall;
     JsonDocument doc;
     int code = 200;
     switch (outcome) {
@@ -1512,36 +1607,29 @@ static void answerUpdateRequest() {
             doc["version"] = info.version;
             break;
         case FwManifestOutcome::NoUpdate:
-            if (install) code = 409;
-            if (install) doc["error"] = "no update available";
+            code = 409;
+            doc["error"] = "no update available";
             doc["current_version"] = FIRMWARE_VERSION;
             doc["available"] = false;
             break;
         default: // UpdateAvailable
-            if (install) {
-                code = 202;
-                doc["state"] = "downloading";
-                doc["version"] = info.version;
-            } else {
-                doc["current_version"] = FIRMWARE_VERSION;
-                doc["available"] = true;
-                doc["version"] = info.version;
-                doc["firmware_size"] = info.firmwareSize;
-                doc["filesystem_size"] = info.filesystemSize;
-            }
+            code = 202;
+            doc["state"] = "downloading";
+            doc["version"] = info.version;
             break;
     }
     sendJsonDoc(request, code, doc);
 }
 
 static void registerUpdateRoutes() {
+    // Antwortet sofort; der Automat holt das Manifest in webServerLoop()
     server.on("/api/update/check", HTTP_GET, [](AsyncWebServerRequest *request) {
         if (!updateStartAllowed(request)) return;
         if (!firmwareUpdateStartCheck()) {
             sendJsonError(request, 503, "out of memory, retry");
             return;
         }
-        holdUpdateRequest(request, false);
+        sendUpdateStatus(request, 202);
     });
 
     registerJsonPost(server, "/api/update/install", MAX_BODY_LEN,
@@ -1584,7 +1672,7 @@ static void registerUpdateRoutes() {
                 sendJsonError(request, 503, "out of memory, retry");
                 return;
             }
-            holdUpdateRequest(request, true);
+            holdUpdateRequest(request);
         });
 
     server.on("/api/update/status", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1597,30 +1685,30 @@ static void registerUpdateRoutes() {
 // on the next boot) or while an image is being written. Without it the device
 // would only answer "Not found" and could be recovered via serial flash only.
 static const char RECOVERY_HTML[] PROGMEM = R"html(<!DOCTYPE html>
-<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PresenceTrack - Wiederherstellung</title></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PresenceTrack - Recovery</title></head>
 <body style="font-family:sans-serif;max-width:560px;margin:2em auto;padding:0 1em">
 <h1>PresenceTrack</h1>
-<p>Die Weboberfl&auml;che fehlt im Dateisystem, z. B. nach einem abgebrochenen Dateisystem-Update.
-Lade das Dateisystem-Image (<code>littlefs.bin</code>) erneut hoch.</p>
-<p><a href="/api/config/backup" download="presence-config-backup.json">Aktuelle Konfiguration sichern</a></p>
+<p>The web UI is missing from the filesystem, e.g. after an interrupted filesystem update.
+Upload the filesystem image (<code>littlefs.bin</code>) again.</p>
+<p><a href="/api/config/backup" download="presencetrack-backup.json">Download backup</a></p>
 <p><label>Firmware (.bin, optional): <input type="file" id="fw" accept=".bin"></label></p>
-<p><label>Dateisystem-Image: <input type="file" id="fs" accept=".bin,.fs"></label></p>
-<p><button onclick="go()">Hochladen</button> <span id="m"></span></p>
-<p>Oder ohne Dateien: <button onclick="gh()">Update von GitHub installieren</button> (Firmware + Web-Oberfl&auml;che)</p>
+<p><label>Filesystem image: <input type="file" id="fs" accept=".bin,.fs"></label></p>
+<p><button onclick="go()">Upload</button> <span id="m"></span></p>
+<p>Or without files: <button onclick="gh()">Install update from GitHub</button> (firmware + web UI)</p>
 <script>
 function st(){fetch('/api/update/status').then(function(r){return r.json()}).then(function(s){
 m.textContent=s.state+(s.bytes_total?' '+Math.round(s.bytes_done*100/s.bytes_total)+' %':'')+(s.error?' - '+s.error:'');
-if(s.state=='rebooting')m.textContent='Fertig - Neustart, Seite in 30 s neu laden.';else if(s.state!='idle'&&s.state!='error')setTimeout(st,1000)})
+if(s.state=='rebooting')m.textContent='Done - restarting, reload the page in 30 s.';else if(s.state!='idle'&&s.state!='error')setTimeout(st,1000)})
 .catch(function(){setTimeout(st,2000)})}
-function gh(){m.textContent='Prüfe GitHub...';fetch('/api/update/install',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"target":"both"}'})
-.then(function(r){return r.json().then(function(j){if(!r.ok)throw j.error||r.status;st()})}).catch(function(e){m.textContent='Fehler: '+e})}
+function gh(){m.textContent='Checking GitHub...';fetch('/api/update/install',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"target":"both"}'})
+.then(function(r){return r.json().then(function(j){if(!r.ok)throw j.error||r.status;st()})}).catch(function(e){m.textContent='Error: '+e})}
 function up(f,u,r){return new Promise(function(ok,no){var x=new XMLHttpRequest(),d=new FormData();d.append('file',f);
 x.open('POST',u+'?size='+f.size+(r?'':'&reboot=0'));x.upload.onprogress=function(e){m.textContent=f.name+': '+Math.round(e.loaded*100/e.total)+' %'};
-x.onload=function(){x.status==200?ok():no(x.responseText)};x.onerror=function(){no('Verbindung verloren')};x.send(d)})}
-async function go(){var a=fw.files[0],b=fs.files[0];if(!a&&!b){m.textContent='Keine Datei gewählt';return}
-try{if(a)await up(a,'/api/firmware',!b);if(b)await up(b,'/api/filesystem',1);m.textContent='Fertig - Neustart, Seite in 30 s neu laden.'}
-catch(e){m.textContent='Fehler: '+e}}
+x.onload=function(){x.status==200?ok():no(x.responseText)};x.onerror=function(){no('connection lost')};x.send(d)})}
+async function go(){var a=fw.files[0],b=fs.files[0];if(!a&&!b){m.textContent='No file selected';return}
+try{if(a)await up(a,'/api/firmware',!b);if(b)await up(b,'/api/filesystem',1);m.textContent='Done - restarting, reload the page in 30 s.'}
+catch(e){m.textContent='Error: '+e}}
 </script></body></html>)html";
 
 static void registerSystemRoutes() {
@@ -1680,6 +1768,23 @@ static void registerSystemRoutes() {
         sendJsonDoc(request, 200, doc);
         webServerScheduleReboot(true);
     });
+
+    // Erases the stored SSID/password, so the next boot opens the WiFiManager
+    // portal (AP_SSID in main.cpp). The erase itself runs in webServerLoop():
+    // it disconnects the station, which would cut off this response, and
+    // WiFiManager::resetSettings() delay()s, which is not allowed in an async
+    // callback (WiFiManager.h also cannot be included here, see web_server.h).
+    server.on("/api/wifi/reset", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (Update.isRunning() || firmwareUpdateBusy()) {
+            sendJsonError(request, 409, "OTA update in progress");
+            return;
+        }
+        JsonDocument doc;
+        doc["status"] = "resetting";
+        sendJsonDoc(request, 200, doc);
+        s_wifiResetPending = true;
+        webServerScheduleReboot(false);
+    });
 }
 
 static void registerStaticRoutes() {
@@ -1716,6 +1821,10 @@ void webServerBegin(AppConfig &cfg) {
     s_bootPins[1] = cfg.ld2450.txPin;
     s_bootPins[2] = cfg.bh1750.sdaPin;
     s_bootPins[3] = cfg.bh1750.sclPin;
+    s_bootWifi = cfg.wifi;
+    IPAddress bootStaticIp;
+    s_staticIpFallback = cfg.wifi.useStaticIp &&
+                         (!bootStaticIp.fromString(cfg.wifi.staticIp) || WiFi.localIP() != bootStaticIp);
 
     registerLd2450Routes();
     registerBh1750Routes();
@@ -1747,6 +1856,12 @@ void webServerLoop() {
     answerUpdateRequest();
 
     if (s_rebootPending && millis() - s_rebootRequestedAt >= REBOOT_DELAY_MS) {
+        if (s_wifiResetPending) {
+            // What WiFiManager::resetSettings() does on the ESP8266: clear the SDK-stored credentials
+            WiFi.persistent(true);
+            WiFi.disconnect(true);
+            WiFi.persistent(false);
+        }
         ESP.restart();
     }
 }

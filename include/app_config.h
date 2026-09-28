@@ -100,8 +100,16 @@ struct HaExposeConfig {
     bool zoneMotion = true; // zone_<i>_motion for every enabled zone
 };
 
+// Hostname and IP settings are applied once at boot (main.cpp, before
+// WiFiManager::autoConnect()); SSID/password stay with the WiFiManager portal.
 struct WifiConfig {
     bool noModemSleep = true; // true -> WIFI_NONE_SLEEP instead of modem sleep
+    char hostname[32] = "presencetrack"; // [A-Za-z0-9-], no leading/trailing '-'
+    bool useStaticIp = false;
+    char staticIp[16] = "";
+    char gateway[16] = "";
+    char subnet[16] = "255.255.255.0";
+    char dns[16] = ""; // empty -> the gateway is used as DNS server
 };
 
 struct AppConfig {

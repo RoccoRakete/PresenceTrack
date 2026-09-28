@@ -12,7 +12,8 @@
 // (siehe web_server.h, HTTP_GET/HTTP_POST-Kollision).
 
 // Öffentlicher Zustand, 1:1 als "state" in /api/update/status:
-//   Checking     Manifest wird geholt (GET /api/update/check oder Vorlauf eines Installs)
+//   Checking     Manifest wird geholt (GET /api/update/check oder Vorlauf eines Installs);
+//                ein check endet danach in Idle, sein Ergebnis steht in "check"
 //   Downloading  Verbindung/Redirects/Header eines Assets, erster Chunk wird geprüft
 //   Flashing     Update.begin() ist durch, die Bytes laufen in den Flash
 //   Rebooting    alles geschrieben und verifiziert, Neustart ist angesetzt
@@ -47,8 +48,8 @@ struct FwManifestInfo {
 // nach dem Dateisystem-Image neu zu speichern (littlefs.bin enthält keine /config.json).
 void firmwareUpdateBegin(AppConfig &cfg);
 
-// Ein Takt des Automaten; aus webServerLoop(). Blockiert nur beim TLS-Verbindungsaufbau
-// (siehe firmware_update.cpp), sonst höchstens ~50 ms pro Aufruf.
+// Ein Takt des Automaten; aus webServerLoop(). Blockiert nur beim TCP-Aufbau (bis 10 s)
+// und beim TLS-Handshake (bis 15 s, siehe firmware_update.cpp), sonst höchstens ~50 ms.
 void firmwareUpdateLoop();
 
 FwUpdateState firmwareUpdateState();
@@ -65,7 +66,8 @@ bool firmwareUpdateStartCheck();
 bool firmwareUpdateStartInstall(FwUpdateTarget target, const char *expectedVersion);
 
 // Pending, solange die Manifest-Abfrage des aktuellen Laufs läuft. error zeigt
-// bei Failed auf die Meldung (gültig bis zum nächsten Lauf).
+// bei Failed auf die Meldung (gültig bis zum nächsten Lauf). Für den wartenden
+// install-Request; ein check liest sein Ergebnis über firmwareUpdateStatusToJson().
 FwManifestOutcome firmwareUpdateManifestOutcome(FwManifestInfo &info, const char *&error);
 
 // Abbruch aus dem Request-Kontext: setzt nur ein Flag, der nächste Takt räumt auf
@@ -82,15 +84,21 @@ bool firmwareUpdateParseTarget(const char *s, FwUpdateTarget &target);
 bool firmwareUpdateVersionValid(const char *s);
 
 // Während eines Laufs nimmt der Webserver nur so viele Verbindungen an (statt
-// MAX_HTTP_CONNECTIONS): der TLS-Download belegt ~15 kB Heap, und jede weitere
+// MAX_HTTP_CONNECTIONS): eine TLS-Verbindung belegt ~16 kB Heap, und jede weitere
 // parallele Verbindung (~2 kB) kann dann ein `new` in der Library scheitern
 // lassen - ein Neustart mitten im Flash-Schreiben. 2 = eine für den Status-Poll
-// bzw. den wartenden check/install-Request, eine für den Abbruch.
+// bzw. den wartenden install-Request, eine für den Abbruch.
 static const uint8_t FW_UPDATE_HTTP_CONNECTIONS = 2;
 
 // /api/update/status als JSON nach buf, ohne Heap (der Status muss auch dann
 // antworten, wenn der TLS-Download den Heap fast aufbraucht). Liefert die Länge,
-// 0 wenn buf zu klein ist. FW_STATUS_JSON_MAX reicht immer; eine sehr lange
-// Fehlermeldung wird notfalls gekürzt.
-static const size_t FW_STATUS_JSON_MAX = 320;
+// 0 wenn buf zu klein ist:
+//   {state, target, version, bytes_done, bytes_total,
+//    check: ""|"running"|"available"|"none"|"failed"|"aborted", current_version,
+//    [available_version, firmware_size, filesystem_size  nur bei check "available"],
+//    error  bei state "error" und check "failed"/"aborted", sonst ""}
+// "check" beschreibt den letzten Lauf, wenn er ein check war; nach einem Install "".
+// FW_STATUS_JSON_MAX reicht immer: ~160 Zeichen Rahmen im Fehlerfall plus die
+// Meldung (bis 239 Zeichen), die notfalls gekürzt wird.
+static const size_t FW_STATUS_JSON_MAX = 416;
 size_t firmwareUpdateStatusToJson(char *buf, size_t size);

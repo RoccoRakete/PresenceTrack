@@ -3,7 +3,7 @@
 
 static const char *CONFIG_PATH = "/config.json";
 static const char *CONFIG_TMP_PATH = "/config.json.tmp";
-static const uint8_t CONFIG_SCHEMA_VERSION = 7; // informational only, not evaluated on load
+static const uint8_t CONFIG_SCHEMA_VERSION = 8; // informational only, not evaluated on load
 
 // Indexed by ObjectType
 static const char *const OBJECT_TYPE_NAMES[OBJECT_TYPE_COUNT] = {
@@ -109,6 +109,12 @@ void AppConfig::toJson(JsonDocument &doc) const {
 
     JsonObject wf = doc["wifi"].to<JsonObject>();
     wf["no_modem_sleep"] = wifi.noModemSleep;
+    wf["hostname"] = wifi.hostname;
+    wf["use_static_ip"] = wifi.useStaticIp;
+    wf["static_ip"] = wifi.staticIp;
+    wf["gateway"] = wifi.gateway;
+    wf["subnet"] = wifi.subnet;
+    wf["dns"] = wifi.dns;
 
     JsonArray zonesArr = doc["zones"].to<JsonArray>();
     for (uint8_t i = 0; i < MAX_ZONES; i++) {
@@ -193,6 +199,13 @@ void AppConfig::fromJson(const JsonDocument &doc) {
     if (doc["wifi"].is<JsonObjectConst>()) {
         JsonObjectConst wf = doc["wifi"];
         wifi.noModemSleep = wf["no_modem_sleep"] | wifi.noModemSleep;
+        // Missing in schema <= 7: default hostname, DHCP
+        strlcpy(wifi.hostname, wf["hostname"] | wifi.hostname, sizeof(wifi.hostname));
+        wifi.useStaticIp = wf["use_static_ip"] | wifi.useStaticIp;
+        strlcpy(wifi.staticIp, wf["static_ip"] | wifi.staticIp, sizeof(wifi.staticIp));
+        strlcpy(wifi.gateway, wf["gateway"] | wifi.gateway, sizeof(wifi.gateway));
+        strlcpy(wifi.subnet, wf["subnet"] | wifi.subnet, sizeof(wifi.subnet));
+        strlcpy(wifi.dns, wf["dns"] | wifi.dns, sizeof(wifi.dns));
     }
 
     if (doc["zones"].is<JsonArrayConst>()) {

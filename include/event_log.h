@@ -15,6 +15,7 @@ enum class EventType : uint8_t {
     Reboot,
     FactoryReset,
     OtaUpdate, // firmware or filesystem image received via /api/firmware, /api/filesystem
+    Network,   // boot-time network setup, e.g. the static IP fallback to DHCP (main.cpp)
 };
 
 struct LogEvent {
