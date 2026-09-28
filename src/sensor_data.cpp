@@ -90,6 +90,15 @@ static const unsigned long MOTION_HOLDOFF_MS = 1200;
 static bool s_targetMovingSeen[LD2450_MAX_TARGETS] = {false};
 static unsigned long s_targetMovingLastSeenMs[LD2450_MAX_TARGETS] = {0};
 
+// Ghost target filter: a target only counts once it has stayed in its slot for
+// ghostMinExistMs, and a jump faster than ghostMaxJumpCmS between two ticks
+// restarts that wait (multipath reflections tend to flicker and teleport).
+static bool s_targetExistSeen[LD2450_MAX_TARGETS] = {false};
+static unsigned long s_targetFirstSeenMs[LD2450_MAX_TARGETS] = {0};
+static int16_t s_targetPrevXMm[LD2450_MAX_TARGETS] = {0};
+static int16_t s_targetPrevYMm[LD2450_MAX_TARGETS] = {0};
+static unsigned long s_targetPrevTickMs[LD2450_MAX_TARGETS] = {0};
+
 static unsigned long s_lastLd2450Update = 0;
 static unsigned long s_lastBh1750Update = 0;
 static bool s_ld2450Cleared = false;
@@ -618,23 +627,76 @@ static void classifyTargetMotion(const AppConfig &cfg, unsigned long now) {
     }
 }
 
+// Plausible/ghost per target slot. Only sets `plausible`, the raw x/y stay
+// untouched. With the filter off every active target is plausible; an
+// inactive slot drops its history like in classifyTargetMotion().
+static void classifyTargetPlausibility(const AppConfig &cfg, unsigned long now) {
+    Ld2450State &s = g_sensorState.ld2450;
+    if (!cfg.ld2450.ghostFilterEnabled) {
+        for (uint8_t t = 0; t < LD2450_MAX_TARGETS; t++) {
+            s.targets[t].plausible = s.targets[t].active;
+            s_targetExistSeen[t] = false; // re-enabling starts from a clean slot history
+        }
+        return;
+    }
+    for (uint8_t t = 0; t < LD2450_MAX_TARGETS; t++) {
+        Ld2450Target &target = s.targets[t];
+        if (!target.active) {
+            s_targetExistSeen[t] = false;
+            target.plausible = false;
+            continue;
+        }
+        bool jumpOk = true;
+        if (s_targetExistSeen[t]) {
+            unsigned long dtMs = now - s_targetPrevTickMs[t];
+            // float: raw coordinates of a corrupt frame may exceed the int32 range when squared
+            float dx = (float)(target.xMm - s_targetPrevXMm[t]);
+            float dy = (float)(target.yMm - s_targetPrevYMm[t]);
+            long distMm = (long)sqrtf(dx * dx + dy * dy);
+            long maxJumpMm = (long)cfg.ld2450.ghostMaxJumpCmS * 10L * (long)dtMs / 1000L;
+            jumpOk = distMm <= maxJumpMm;
+        }
+        if (!jumpOk) {
+            s_targetExistSeen[t] = false; // treat a rejected jump as a fresh reappearance
+        }
+        s_targetPrevXMm[t] = target.xMm;
+        s_targetPrevYMm[t] = target.yMm;
+        s_targetPrevTickMs[t] = now;
+
+        if (!s_targetExistSeen[t]) {
+            s_targetExistSeen[t] = true;
+            s_targetFirstSeenMs[t] = now;
+        }
+        bool existOk = now - s_targetFirstSeenMs[t] >= cfg.ld2450.ghostMinExistMs;
+        bool wasPlausible = target.plausible;
+        target.plausible = jumpOk && existOk;
+        // Only on the transition, a suppressed target does not log again every tick.
+        // Gated on the jump check so re-enabling the filter (history reset) stays silent.
+        if (wasPlausible && !jumpOk) {
+            eventLogPush(EventType::Sensor, "Ghost target suppressed (slot %u)", t);
+        }
+    }
+}
+
 // Firmware-side evaluation (independent of simulated vs. real targets):
 // target count, per-zone point-in-rectangle check, occupancy timeout and
 // moving/still (derived from the debounced target state, no extra hold-off).
+// Only plausible targets (see classifyTargetPlausibility) are evaluated.
 static void evaluateLd2450Presence(const AppConfig &cfg, unsigned long now) {
     Ld2450State &s = g_sensorState.ld2450;
     const unsigned long holdMs = (unsigned long)cfg.ld2450.occupancyTimeoutS * 1000UL;
 
+    classifyTargetPlausibility(cfg, now);
     uint8_t count = 0;
     for (uint8_t t = 0; t < LD2450_MAX_TARGETS; t++) {
-        if (s.targets[t].active) count++;
+        if (s.targets[t].active && s.targets[t].plausible) count++;
     }
     s.targetCount = count;
 
     classifyTargetMotion(cfg, now);
     bool anyMoving = false;
     for (uint8_t t = 0; t < LD2450_MAX_TARGETS; t++) {
-        anyMoving = anyMoving || (s.targets[t].active && s.targets[t].moving);
+        anyMoving = anyMoving || (s.targets[t].active && s.targets[t].plausible && s.targets[t].moving);
     }
 
     for (uint8_t i = 0; i < MAX_ZONES; i++) {
@@ -652,8 +714,9 @@ static void evaluateLd2450Presence(const AppConfig &cfg, unsigned long now) {
         bool movingHit = false;
         for (uint8_t t = 0; t < LD2450_MAX_TARGETS; t++) {
             const Ld2450Target &target = s.targets[t];
-            // Per-zone signal filter only; target count / global presence stay unfiltered
-            if (!target.active || target.resolution < z.minResolution || !targetInZone(target, z)) continue;
+            // Resolution is a per-zone filter only; target count / global presence ignore it
+            if (!target.active || !target.plausible || target.resolution < z.minResolution ||
+                !targetInZone(target, z)) continue;
             hit = true;
             movingHit = movingHit || target.moving;
         }
@@ -750,7 +813,14 @@ static void clearLd2450State() {
     g_sensorState.ld2450 = Ld2450State{};
     s_presenceSeen = false;
     for (uint8_t i = 0; i < MAX_ZONES; i++) s_zoneSeen[i] = false;
-    for (uint8_t t = 0; t < LD2450_MAX_TARGETS; t++) s_targetMovingSeen[t] = false;
+    for (uint8_t t = 0; t < LD2450_MAX_TARGETS; t++) {
+        s_targetMovingSeen[t] = false;
+        s_targetExistSeen[t] = false;
+        s_targetFirstSeenMs[t] = 0;
+        s_targetPrevXMm[t] = 0;
+        s_targetPrevYMm[t] = 0;
+        s_targetPrevTickMs[t] = 0;
+    }
 }
 
 // Applies a changed sim_enabled setting. The values of the previous data

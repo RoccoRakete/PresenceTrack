@@ -519,6 +519,9 @@ static void ld2450ToJson(const Ld2450Config &c, JsonDocument &doc) {
     doc["occupancy_timeout_s"] = c.occupancyTimeoutS;
     doc["sim_enabled"] = c.simEnabled;
     doc["moving_threshold_cm_s"] = c.movingThresholdCmS;
+    doc["ghost_filter_enabled"] = c.ghostFilterEnabled;
+    doc["ghost_min_exist_ms"] = c.ghostMinExistMs;
+    doc["ghost_max_jump_cm_s"] = c.ghostMaxJumpCmS;
     doc["rx_pin"] = c.rxPin;
     doc["tx_pin"] = c.txPin;
     const PinField pins[] = {{"rx_pin", c.rxPin, s_bootPins[0]}, {"tx_pin", c.txPin, s_bootPins[1]}};
@@ -693,6 +696,9 @@ static void registerLd2450Routes() {
                 !validateInt(o, "occupancy_timeout_s", 0, 3600, err) ||
                 !validateBool(o, "sim_enabled", err) ||
                 !validateInt(o, "moving_threshold_cm_s", 0, 1000, err) ||
+                !validateBool(o, "ghost_filter_enabled", err) ||
+                !validateInt(o, "ghost_min_exist_ms", 0, 5000, err) ||
+                !validateInt(o, "ghost_max_jump_cm_s", 100, 2000, err) ||
                 !validatePin(o, "rx_pin", err) ||
                 !validatePin(o, "tx_pin", err)) {
                 sendJsonError(request, 400, err);
@@ -706,6 +712,9 @@ static void registerLd2450Routes() {
             next.occupancyTimeoutS = o["occupancy_timeout_s"] | next.occupancyTimeoutS;
             next.simEnabled = o["sim_enabled"] | next.simEnabled;
             next.movingThresholdCmS = o["moving_threshold_cm_s"] | next.movingThresholdCmS;
+            next.ghostFilterEnabled = o["ghost_filter_enabled"] | next.ghostFilterEnabled;
+            next.ghostMinExistMs = o["ghost_min_exist_ms"] | next.ghostMinExistMs;
+            next.ghostMaxJumpCmS = o["ghost_max_jump_cm_s"] | next.ghostMaxJumpCmS;
             next.rxPin = o["rx_pin"] | next.rxPin;
             next.txPin = o["tx_pin"] | next.txPin;
             if (const char *pinErr = ld2450PinError(next.rxPin, next.txPin)) {
@@ -1221,6 +1230,7 @@ static void registerStateRoute() {
             t["speed_cm_s"] = ld.targets[i].speedCmS;
             t["resolution"] = ld.targets[i].resolution;
             t["moving"] = ld.targets[i].moving;
+            t["plausible"] = ld.targets[i].plausible;
         }
         JsonArray zp = l["zone_presence"].to<JsonArray>();
         for (uint8_t i = 0; i < MAX_ZONES; i++) {

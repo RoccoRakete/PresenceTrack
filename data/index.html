@@ -66,12 +66,15 @@
     <label class="row"><span>Max range (mm)</span><input type="number" id="ld-max-range-mm" min="1000" max="6000"></label>
     <label class="row"><span>Occupancy timeout (s)</span><input type="number" id="ld-occupancy-timeout-s" min="0" max="3600"></label>
     <label class="row"><span>Moving threshold (cm/s)</span><input type="number" id="ld-moving-threshold-cm-s" min="0" max="1000"></label>
+    <label class="row"><span>Ghost target filter</span><input type="checkbox" id="ld-ghost-filter-enabled" class="switch"></label>
+    <label class="row"><span>Min. time before a target counts (ms)</span><input type="number" id="ld-ghost-min-exist-ms" min="0" max="5000"></label>
+    <label class="row"><span>Max. plausible jump speed (cm/s)</span><input type="number" id="ld-ghost-max-jump-cm-s" min="100" max="2000"></label>
     <label class="row"><span>Simulation enabled</span><input type="checkbox" id="ld-sim-enabled" class="switch"></label>
     <label class="row"><span>RX pin</span><select id="ld-rx-pin" class="pin-select"></select></label>
     <p class="muted warn" id="ld-rx-pin-warn" hidden></p>
     <label class="row"><span>TX pin</span><select id="ld-tx-pin" class="pin-select"></select></label>
     <p class="muted warn" id="ld-tx-pin-warn" hidden></p>
-    <p class="muted">Presence stays active for the occupancy timeout after the last target was lost. A target counts as moving while its speed is at least the moving threshold (0 = always moving). With simulation disabled the targets come from the radar via UART (256000 baud). The default pins RX 13 / TX 15 (D7/D8) use the hardware UART, so the USB serial log ends after boot; other pins use a software UART. Pins take effect after a restart.</p>
+    <p class="muted">Presence stays active for the occupancy timeout after the last target was lost. A target counts as moving while its speed is at least the moving threshold (0 = always moving). The ghost target filter ignores targets until they have stayed for the minimum time (0 = off) and drops targets that jump faster than the max. jump speed, typical for radar reflections. With simulation disabled the targets come from the radar via UART (256000 baud). The default pins RX 13 / TX 15 (D7/D8) use the hardware UART, so the USB serial log ends after boot; other pins use a software UART. Pins take effect after a restart.</p>
   </div>
 </section>
 

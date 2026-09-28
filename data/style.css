@@ -160,6 +160,7 @@ input:invalid { border-color: var(--danger); }
 .shape-handle[data-corner="1"], .shape-handle[data-corner="3"] { cursor: nesw-resize; }
 .map-target { fill: var(--tc); stroke: var(--bg); stroke-width: 2; pointer-events: none; transition: transform 1.8s linear; }
 .map-target.moving { animation: target-pulse 1s ease-in-out infinite; }
+.map-target.suppressed { fill: var(--muted); opacity: .5; }
 @keyframes target-pulse { 50% { opacity: .4; } }
 .target-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; background: var(--tc); }
 

@@ -131,7 +131,13 @@ function restartButton(question) {
 function applyRestartStatus(sec, res, saved) {
   if (!(sec.pins || sec.restart) || !res) return false;
   if (sec.pins) renderPinWarnings(sec.pins, res.pin_warnings);
-  if (!res.restart_required) return false;
+  if (!res.restart_required) {
+    // A restart hint from an earlier response is stale once the device no longer asks for it;
+    // clear the leftover restart button too, or it stays focusable/clickable while invisible
+    const el = $('#' + sec.ind);
+    if (el.classList.contains('warn')) { el.className = 'save-indicator'; el.textContent = ''; }
+    return false;
+  }
   const question = sec.restart || 'Reboot the device now to apply the new pins?';
   setIndicator(sec, 'warn', saved ? 'Saved – restart required' : 'Restart required', restartButton(question));
   return true;
@@ -144,6 +150,9 @@ function renderLd(c) {
   setVal('ld-max-range-mm', c.max_range_mm);
   setVal('ld-occupancy-timeout-s', c.occupancy_timeout_s);
   setVal('ld-moving-threshold-cm-s', c.moving_threshold_cm_s);
+  setChk('ld-ghost-filter-enabled', c.ghost_filter_enabled);
+  setVal('ld-ghost-min-exist-ms', c.ghost_min_exist_ms);
+  setVal('ld-ghost-max-jump-cm-s', c.ghost_max_jump_cm_s);
   setChk('ld-sim-enabled', c.sim_enabled);
   setVal('ld-rx-pin', c.rx_pin);
   setVal('ld-tx-pin', c.tx_pin);
@@ -155,6 +164,9 @@ function collectLd() {
     max_range_mm: num('ld-max-range-mm', 'Max range'),
     occupancy_timeout_s: num('ld-occupancy-timeout-s', 'Occupancy timeout'),
     moving_threshold_cm_s: num('ld-moving-threshold-cm-s', 'Moving threshold'),
+    ghost_filter_enabled: $('#ld-ghost-filter-enabled').checked,
+    ghost_min_exist_ms: num('ld-ghost-min-exist-ms', 'Min. time before a target counts'),
+    ghost_max_jump_cm_s: num('ld-ghost-max-jump-cm-s', 'Max. plausible jump speed'),
     sim_enabled: $('#ld-sim-enabled').checked,
     rx_pin: +$('#ld-rx-pin').value,
     tx_pin: +$('#ld-tx-pin').value
@@ -534,6 +546,9 @@ function drawTargets(m, targets) {
       c.style.transform = `translate(${tg.x_mm}px, ${tg.y_mm}px)`;
     }
     c.classList.toggle('moving', on && !!tg.moving);
+    // Ghost-filtered targets (plausible === false) still get a marker, dimmed, so the
+    // ghost filter's effect is visible on the map instead of looking identical to a counted target.
+    c.classList.toggle('suppressed', on && tg.plausible === false);
     c.setAttribute('visibility', on ? 'visible' : 'hidden');
   });
 }
@@ -1054,17 +1069,38 @@ function openTab(name) {
 }
 
 // ---------- Reboot / factory reset ----------
+// Resolves once the device answers from a boot that started after `since` (Date.now()),
+// or after the timeout. A fixed delay is not enough: the restart only happens in loop(),
+// which a blocking MQTT reconnect can hold up for seconds, and a reload that still
+// reaches the old instance shows its pre-restart state (e.g. "Restart required") for good.
+async function waitForRestart(since) {
+  const deadline = since + OTA_POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await sleep(OTA_POLL_INTERVAL_MS);
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), OTA_PROBE_TIMEOUT_MS);
+    try {
+      const res = await fetch('/api/state', { cache: 'no-store', signal: ctl.signal });
+      const s = res.ok ? await res.json() : null;
+      if (s && s.uptime_s * 1000 < Date.now() - since) return;
+    } catch (e) { /* still rebooting */ } finally { clearTimeout(timer); }
+  }
+}
+
 // msg: element for the progress/error text (default: the Device card on the Status tab).
 async function deviceAction(path, question, msg = $('#device-msg')) {
   if (!confirm(question)) return;
+  const since = Date.now();
   try {
     await apiPost(path);
     msg.textContent = 'Rebooting…';
     $$('.actions button').forEach(b => { b.disabled = true; });
-    setTimeout(() => location.reload(), 5000);
   } catch (e) {
     msg.textContent = 'Error: ' + e.message;
+    return;
   }
+  await waitForRestart(since);
+  location.reload();
 }
 
 // ---------- Backup / restore ----------

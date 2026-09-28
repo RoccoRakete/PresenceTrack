@@ -4,7 +4,7 @@
 
 static const char *CONFIG_PATH = "/config.json";
 static const char *CONFIG_TMP_PATH = "/config.json.tmp";
-static const uint8_t CONFIG_SCHEMA_VERSION = 9; // informational only, not evaluated on load
+static const uint8_t CONFIG_SCHEMA_VERSION = 10; // informational only, not evaluated on load
 
 // Indexed by ObjectType
 static const char *const OBJECT_TYPE_NAMES[OBJECT_TYPE_COUNT] = {
@@ -78,6 +78,9 @@ void AppConfig::toJson(JsonDocument &doc) const {
     ld["occupancy_timeout_s"] = ld2450.occupancyTimeoutS;
     ld["sim_enabled"] = ld2450.simEnabled;
     ld["moving_threshold_cm_s"] = ld2450.movingThresholdCmS;
+    ld["ghost_filter_enabled"] = ld2450.ghostFilterEnabled;
+    ld["ghost_min_exist_ms"] = ld2450.ghostMinExistMs;
+    ld["ghost_max_jump_cm_s"] = ld2450.ghostMaxJumpCmS;
     ld["rx_pin"] = ld2450.rxPin;
     ld["tx_pin"] = ld2450.txPin;
 
@@ -170,6 +173,9 @@ void AppConfig::fromJson(const JsonDocument &doc) {
         ld2450.occupancyTimeoutS = ld["occupancy_timeout_s"] | ld2450.occupancyTimeoutS;
         ld2450.simEnabled = ld["sim_enabled"] | ld2450.simEnabled;
         ld2450.movingThresholdCmS = ld["moving_threshold_cm_s"] | ld2450.movingThresholdCmS;
+        ld2450.ghostFilterEnabled = ld["ghost_filter_enabled"] | ld2450.ghostFilterEnabled;
+        ld2450.ghostMinExistMs = ld["ghost_min_exist_ms"] | ld2450.ghostMinExistMs;
+        ld2450.ghostMaxJumpCmS = ld["ghost_max_jump_cm_s"] | ld2450.ghostMaxJumpCmS;
         ld2450.rxPin = ld["rx_pin"] | ld2450.rxPin;
         ld2450.txPin = ld["tx_pin"] | ld2450.txPin;
 

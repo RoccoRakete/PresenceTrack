@@ -14,6 +14,7 @@ struct Ld2450Target {
     int16_t speedCmS = 0;
     uint16_t resolution = 0; // raw value from the target frame (simulated with sim_enabled)
     bool moving = false; // |speedCmS| >= movingThresholdCmS, debounced per slot
+    bool plausible = false; // passed the ghost-target debounce/jump check, gates zone & count evaluation
 };
 
 struct Ld2450State {

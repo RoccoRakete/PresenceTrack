@@ -82,6 +82,9 @@ struct Ld2450Config {
     uint16_t occupancyTimeoutS = 5;  // hold-off before presence goes false after last target loss (firmware-side, no sensor equivalent)
     bool simEnabled = true;          // simulated targets instead of the UART frames
     uint16_t movingThresholdCmS = 10; // |speed| >= threshold -> target counts as moving (0..1000)
+    bool ghostFilterEnabled = true;   // debounce + jump-distance check against short-lived multipath ghost targets
+    uint16_t ghostMinExistMs = 500;   // min. time a target must stay active in its slot before it counts (0 = off)
+    uint16_t ghostMaxJumpCmS = 300;   // max plausible target speed between evaluation ticks; larger jumps are rejected
     // GPIO numbers, read at boot: 13/15 = hardware UART0 swapped to D7/D8, else SoftwareSerial
     uint8_t rxPin = 13; // D7
     uint8_t txPin = 15; // D8
