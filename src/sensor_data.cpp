@@ -1,6 +1,7 @@
 #include "sensor_data.h"
 #include "event_log.h"
 #include <SoftwareSerial.h>
+#include <Wire.h>
 
 SensorState g_sensorState;
 
@@ -21,6 +22,31 @@ static Ld2450RxState s_ld2450RxState = Ld2450RxState::WaitHeader;
 static uint8_t s_ld2450RxPos = 0; // matched header/footer bytes or collected body bytes
 static uint8_t s_ld2450Body[LD2450_BODY_BYTES];
 static unsigned long s_ld2450LastFrameMs = 0;
+
+// BH1750 I2C (BH1750FVI datasheet): continuous measurement modes, indexed by
+// Bh1750Config::mode. measureMs is the maximum conversion time at the default
+// MTreg (69); lux = count / 1.2, Mode2 halves the step to 0.5 lx per count.
+struct Bh1750Mode {
+    uint8_t opcode;
+    uint8_t measureMs;
+    float luxPerCount;
+};
+static const Bh1750Mode BH1750_MODES[] = {
+    {0x10, 180, 1.0f / 1.2f}, // 0: Continuous High Res (1 lx)
+    {0x11, 180, 0.5f / 1.2f}, // 1: Continuous High Res Mode2 (0.5 lx)
+    {0x13, 24, 1.0f / 1.2f},  // 2: Continuous Low Res (4 lx)
+};
+static const uint8_t BH1750_MODE_COUNT = sizeof(BH1750_MODES) / sizeof(BH1750_MODES[0]);
+static const uint8_t BH1750_POWER_DOWN = 0x00;
+static const uint8_t BH1750_POWER_ON = 0x01;
+
+static bool s_bh1750WireReady = false;   // Wire.begin() done, false on invalid pins
+static bool s_bh1750Measuring = false;   // mode command sent, conversion pending
+static unsigned long s_bh1750MeasureStartMs = 0;
+static uint8_t s_bh1750MeasureAddr = 0;  // address/mode of the pending conversion,
+static uint8_t s_bh1750MeasureMode = 0;  // so a config change mid-conversion is harmless
+static bool s_bh1750Responding = true;   // only for logging state changes, not every failure
+static bool s_bh1750Cleared = false;
 
 // Simulation tick, independent of the 2 s web UI poll so that targets move smoothly.
 static const unsigned long LD2450_TICK_MS = 300;
@@ -119,10 +145,37 @@ static void ld2450UartBegin(const AppConfig &cfg) {
     }
 }
 
+// The core's software I2C drives the pins open-drain through the GPIO0-15
+// registers; GPIO16 sits outside them.
+static const char *bh1750PinError(uint8_t sdaPin, uint8_t sclPin) {
+    if (sdaPin == sclPin) return "SDA and SCL must be different GPIOs";
+    if (sdaPin == 16 || sclPin == 16) return "GPIO16 (D0) has no open-drain support and cannot drive I2C";
+    return nullptr;
+}
+
+// Opens the I2C bus on cfg.bh1750.sdaPin / sclPin. Like the LD2450 pins they
+// are only read here at boot; address and mode are applied per measurement.
+static void bh1750WireBegin(const AppConfig &cfg) {
+    const uint8_t sda = cfg.bh1750.sdaPin;
+    const uint8_t scl = cfg.bh1750.sclPin;
+    if (const char *err = bh1750PinError(sda, scl)) {
+        // Normally rejected by the web UI; guards against a hand-edited config.
+        Serial.printf("BH1750 disabled: %s\n", err);
+        return;
+    }
+    Wire.begin(sda, scl);
+    s_bh1750WireReady = true;
+    // Presence probe for the boot log only; a missing sensor is retried every interval.
+    Wire.beginTransmission(cfg.bh1750.i2cAddress);
+    bool found = Wire.endTransmission() == 0;
+    Serial.printf("BH1750 on I2C SDA=%u SCL=%u address 0x%02X%s\n", sda, scl,
+                  cfg.bh1750.i2cAddress, found ? "" : " - not responding");
+}
+
 void sensorsBegin(const AppConfig &cfg) {
+    // Before the LD2450: its UART0 swap ends the USB serial log.
+    bh1750WireBegin(cfg);
     ld2450UartBegin(cfg);
-    // TODO: once the hardware is connected, initialize I2C (BH1750) via
-    // Wire.begin(cfg.bh1750.sdaPin, cfg.bh1750.sclPin).
     randomSeed(micros());
 
     unsigned long now = millis();
@@ -425,6 +478,71 @@ static void simulateBh1750() {
     s.valid = true;
 }
 
+static bool bh1750Command(uint8_t address, uint8_t opcode) {
+    Wire.beginTransmission(address);
+    Wire.write(opcode);
+    return Wire.endTransmission() == 0;
+}
+
+// No ACK or a short read: the last value is dropped instead of frozen (MQTT
+// stops publishing, the web UI shows "-"); the next interval simply retries.
+static void bh1750Failed(const char *step) {
+    s_bh1750Measuring = false;
+    g_sensorState.bh1750.valid = false;
+    if (s_bh1750Responding && serialLogEnabled()) {
+        Serial.printf("BH1750 %s failed - sensor not responding\n", step);
+    }
+    s_bh1750Responding = false;
+}
+
+// The mode command is sent again every interval: this picks up a changed
+// address or mode without extra bookkeeping and re-arms a sensor that was
+// power cycled (it restarts in power-down and would keep a stale count).
+static void bh1750StartMeasurement(const AppConfig &cfg, unsigned long now) {
+    if (!s_bh1750WireReady) return; // invalid pins, valid stays false
+    const uint8_t addr = cfg.bh1750.i2cAddress;
+    const uint8_t mode = cfg.bh1750.mode < BH1750_MODE_COUNT ? cfg.bh1750.mode : 0;
+    if (!bh1750Command(addr, BH1750_POWER_ON) || !bh1750Command(addr, BH1750_MODES[mode].opcode)) {
+        bh1750Failed("mode command");
+        return;
+    }
+    s_bh1750Measuring = true;
+    s_bh1750MeasureStartMs = now;
+    s_bh1750MeasureAddr = addr;
+    s_bh1750MeasureMode = mode;
+}
+
+// Non-blocking: checked every loop() while a conversion is pending, the result
+// is fetched once the maximum conversion time of the mode has passed.
+static void bh1750PollResult(unsigned long now) {
+    const Bh1750Mode &mode = BH1750_MODES[s_bh1750MeasureMode];
+    if (now - s_bh1750MeasureStartMs < mode.measureMs) return;
+    s_bh1750Measuring = false;
+
+    if (Wire.requestFrom(s_bh1750MeasureAddr, (uint8_t)2) != 2) {
+        bh1750Failed("read");
+        return;
+    }
+    uint16_t count = (uint16_t)Wire.read() << 8;
+    count |= (uint8_t)Wire.read();
+
+    Bh1750State &s = g_sensorState.bh1750;
+    s.lux = (float)count * mode.luxPerCount;
+    s.valid = true;
+    g_sensorState.bh1750LastUpdateMs = now;
+    if (!s_bh1750Responding && serialLogEnabled()) {
+        Serial.println("BH1750 responding again");
+    }
+    s_bh1750Responding = true;
+}
+
+// Aborts a pending conversion and puts the sensor to sleep (sensor disabled or
+// simulation on). Best effort: a missing sensor just does not ACK.
+static void bh1750Stop(const AppConfig &cfg) {
+    s_bh1750Measuring = false;
+    if (s_bh1750WireReady) bh1750Command(cfg.bh1750.i2cAddress, BH1750_POWER_DOWN);
+}
+
 // Drops all LD2450 targets and presence (incl. debounce), e.g. when the data source changes.
 static void clearLd2450State() {
     g_sensorState.ld2450 = Ld2450State{};
@@ -447,6 +565,7 @@ static void syncSimMode(const AppConfig &cfg, unsigned long now) {
     if (cfg.bh1750.simEnabled != g_sensorState.bh1750SimMode) {
         g_sensorState.bh1750SimMode = cfg.bh1750.simEnabled;
         g_sensorState.bh1750 = Bh1750State{};
+        bh1750Stop(cfg); // real sensor: re-armed by the reading right below
         s_lastBh1750Update = now - cfg.bh1750.intervalMs - 1; // next reading right away
     }
 }
@@ -478,12 +597,24 @@ void sensorsLoop(const AppConfig &cfg) {
         s_ld2450Cleared = true;
     }
 
-    if (cfg.bh1750.enabled && now - s_lastBh1750Update > cfg.bh1750.intervalMs) {
-        s_lastBh1750Update = now;
-        if (cfg.bh1750.simEnabled) {
-            simulateBh1750();
-            g_sensorState.bh1750LastUpdateMs = now;
+    if (cfg.bh1750.enabled) {
+        s_bh1750Cleared = false;
+        if (s_bh1750Measuring && !cfg.bh1750.simEnabled) {
+            bh1750PollResult(now);
         }
-        // TODO: read the real BH1750 driver via I2C
+        if (now - s_lastBh1750Update > cfg.bh1750.intervalMs) {
+            s_lastBh1750Update = now;
+            if (cfg.bh1750.simEnabled) {
+                simulateBh1750();
+                g_sensorState.bh1750LastUpdateMs = now;
+            } else if (!s_bh1750Measuring) {
+                bh1750StartMeasurement(cfg, now);
+            }
+        }
+    } else if (!s_bh1750Cleared) {
+        // Disabled sensor must not keep reporting a stale illuminance
+        g_sensorState.bh1750 = Bh1750State{};
+        bh1750Stop(cfg);
+        s_bh1750Cleared = true;
     }
 }

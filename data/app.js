@@ -819,8 +819,10 @@ function setMqtt(connected) {
   chip.textContent = connected ? 'MQTT connected' : 'MQTT disconnected';
   chip.classList.toggle('on', !!connected);
 }
-// Data source of a sensor: simulation, none (simulation off, no driver yet) or real hardware.
-const sensorSource = x => x.sim_mode ? 'sim' : x.sim_enabled === false ? 'none' : 'hw';
+// Data source of a sensor: simulation, real hardware (valid reading) or none (simulation off, no sensor data).
+// `valid` is optional: sensors without an explicit reading-validity flag (e.g. LD2450) are treated as valid
+// whenever they are not simulated, since their absence of data instead shows up via a stale last_update_ms.
+const sensorSource = x => x.sim_mode ? 'sim' : x.valid === false ? 'none' : 'hw';
 const SIM_TEXT = { sim: 'Active', none: 'Inactive (no sensor data)', hw: 'Off' };
 const SOURCE_CHIP = { sim: ['Simulated', 'warn'], none: ['Inactive (no sensor data)', ''], hw: ['Hardware', 'on'] };
 const setSimChip = (id, x) => setChip(id, ...SOURCE_CHIP[sensorSource(x)]);

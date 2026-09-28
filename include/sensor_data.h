@@ -3,10 +3,8 @@
 #include <Arduino.h>
 #include "app_config.h"
 
-// Shared runtime state, filled by the drivers (LD2450 via UART or simulated,
-// BH1750 simulated so far) and read by the web server / MQTT / HA layer.
-// A real BH1750 driver only has to fill Bh1750State - the data structure
-// stays the same.
+// Shared runtime state, filled by the drivers (LD2450 via UART, BH1750 via I2C,
+// each optionally simulated) and read by the web server / MQTT / HA layer.
 static const uint8_t LD2450_MAX_TARGETS = 3;
 
 struct Ld2450Target {
@@ -49,7 +47,7 @@ extern SensorState g_sensorState;
 // (no pin-change interrupt).
 const char *ld2450PinError(uint8_t rxPin, uint8_t txPin);
 
-// Initializes the sensor drivers (LD2450 UART on the configured pins) based on the current config.
+// Initializes the sensor drivers (LD2450 UART, BH1750 I2C bus on the configured pins) based on the current config.
 void sensorsBegin(const AppConfig &cfg);
 
 // False once sensorsBegin() has swapped UART0 onto the LD2450 (RX 13 / TX 15):

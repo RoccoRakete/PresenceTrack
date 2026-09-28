@@ -73,7 +73,7 @@ struct Bh1750Config {
     uint8_t mode = 0;
     uint32_t intervalMs = 5000;
     bool simEnabled = true;
-    // GPIO numbers; stored and validated only, no I2C driver uses them yet
+    // GPIO numbers of the I2C bus, read at boot (address and mode apply at the next reading)
     uint8_t sdaPin = 4; // D2
     uint8_t sclPin = 5; // D1
 };
