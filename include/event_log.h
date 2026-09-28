@@ -16,6 +16,7 @@ enum class EventType : uint8_t {
     FactoryReset,
     OtaUpdate, // firmware or filesystem image received via /api/firmware, /api/filesystem
     Network,   // boot-time network setup, e.g. the static IP fallback to DHCP (main.cpp)
+    Sensor,    // boot-time sensor configuration, e.g. the LD2450 region filter (sensor_data.cpp)
 };
 
 struct LogEvent {

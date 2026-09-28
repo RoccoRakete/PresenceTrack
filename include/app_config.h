@@ -54,6 +54,27 @@ const char *objectTypeToString(uint8_t type);
 // Returns -1 for unknown or missing names.
 int objectTypeFromString(const char *s);
 
+// Region filter inside the LD2450 itself (command 0x00C2): targets in these
+// rectangles are never reported by the sensor. Unrelated to ZoneConfig, which
+// only evaluates presence in firmware. Sent to the sensor once at boot.
+static const uint8_t LD2450_REGION_COUNT = 3; // fixed by the sensor protocol
+
+enum Ld2450RegionFilterMode : uint8_t {
+    REGION_FILTER_OFF = 0,
+    // 1 = "detect only inside the regions" exists in the sensor but is deliberately not offered
+    REGION_FILTER_EXCLUDE = 2,
+};
+
+// Same coordinate system as ZoneConfig (mm, x1 < x2, y1 < y2 for present slots).
+struct Ld2450RegionFilterConfig {
+    uint8_t mode = REGION_FILTER_OFF;
+    int16_t x1[LD2450_REGION_COUNT] = {0};
+    int16_t y1[LD2450_REGION_COUNT] = {0};
+    int16_t x2[LD2450_REGION_COUNT] = {0};
+    int16_t y2[LD2450_REGION_COUNT] = {0};
+    bool present[LD2450_REGION_COUNT] = {false}; // slot in use; unused slots are sent as all zeros
+};
+
 struct Ld2450Config {
     bool enabled = true;
     bool multiTarget = true;        // native sensor mode preference (for later real UART command)
@@ -64,6 +85,7 @@ struct Ld2450Config {
     // GPIO numbers, read at boot: 13/15 = hardware UART0 swapped to D7/D8, else SoftwareSerial
     uint8_t rxPin = 13; // D7
     uint8_t txPin = 15; // D8
+    Ld2450RegionFilterConfig regionFilter; // read at boot, like the pins
 };
 
 struct Bh1750Config {

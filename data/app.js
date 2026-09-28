@@ -3,7 +3,7 @@
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
-const ZONES = 6, OBJECTS = 12, TARGETS = 3, EVENTS_MAX = 64, DEBOUNCE_MS = 500;
+const ZONES = 6, OBJECTS = 12, EXCLUSIONS = 3, TARGETS = 3, EVENTS_MAX = 64, DEBOUNCE_MS = 500;
 // Map geometry in mm; matches the SVG viewBox and the /api/zones + /api/objects limits.
 const MAP = { xMin: -6000, xMax: 6000, yMin: 0, yMax: 6000, vbW: 12000, vbH: 6600 };
 const MIN_SHAPE_MM = 100, SNAP_MM = 10;
@@ -14,6 +14,11 @@ const SNAP_PX = 10, SNAP_PX_COARSE = 16, GRID_SNAP_MM = 500;
 const EDGE_SNAP_TOL_MM = 200, GRID_SNAP_TOL_MM = GRID_SNAP_MM / 4;
 // Rectangle given to a newly added zone (map center).
 const NEW_ZONE_RECT = { x1: -1000, y1: 2000, x2: 1000, y2: 4000 };
+// A newly added sensor exclusion zone (e.g. a fan or curtain near the sensor) gets a 1 x 1 m
+// cell of a row in front of the sensor, so that several new ones do not stack.
+const newExclusionRect = i => ({ x1: -1700 + i * 1200, y1: 1000, x2: -700 + i * 1200, y2: 2000 });
+// Region filter modes of /api/region-filter; the sensor's "detect only" mode 1 is not offered.
+const REGION_FILTER_OFF = 0, REGION_FILTER_EXCLUDE = 2;
 // A newly added object gets a 400 x 400 mm cell of a 4 x 3 grid around the map center
 // (same as the firmware defaults), so that several new objects do not stack.
 const newObjectRect = i => {
@@ -31,12 +36,13 @@ const BOARD_PINS = [[16, 'D0'], [5, 'D1'], [4, 'D2'], [0, 'D3'], [2, 'D4'], [14,
 const EVENT_LABELS = {
   presence_changed: 'Presence', zone_enter: 'Zone enter', zone_exit: 'Zone exit', mqtt_connected: 'MQTT',
   mqtt_disconnected: 'MQTT', config_changed: 'Config', reboot: 'System', factory_reset: 'Factory reset',
-  ota_update: 'Update', network: 'Network'
+  ota_update: 'Update', network: 'Network', sensor: 'Sensor'
 };
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 let zonesConfig = [];   // zones last confirmed by the server (for the status map)
 let objectsConfig = []; // objects last confirmed by the server (status map + zone list)
+let exclusionsConfig = []; // sensor exclusion zones last confirmed by the server (status map)
 let eventLog = [];      // events from /api/events, oldest first
 let lastEventId = 0, eventsUptimeMs = 0, eventsBusy = false;
 let lastPresence = [];  // zone_presence from /api/state
@@ -155,13 +161,18 @@ function collectLd() {
   };
 }
 
-// ---------- Zones + objects (map shapes) ----------
-// Both are index-based slots with an axis-aligned rectangle; the cards (form inputs) are the
+// ---------- Zones, sensor exclusion zones + objects (map shapes) ----------
+// All are index-based slots with an axis-aligned rectangle; the cards (form inputs) are the
 // source of truth, the maps are redrawn from them. Objects are for orientation only (no presence).
+// Exclusion zones are the LD2450's own region filter: the sensor never reports targets inside
+// them. They have no name and share one on/off toggle (#region-filter-enabled) instead.
 const KINDS = {
   zone: { count: ZONES, tpl: '#zone-card-template', list: '#zone-list', label: 'Zone', section: 'zones' },
+  exclusion: { count: EXCLUSIONS, tpl: '#exclusion-card-template', list: '#exclusion-list', label: 'Exclusion zone',
+    section: 'regionFilter', unnamed: true },
   object: { count: OBJECTS, tpl: '#object-card-template', list: '#object-list', label: 'Object', section: 'objects' }
 };
+const exclusionName = i => 'Exclusion ' + (i + 1);
 function buildShapeCards(kind) {
   const k = KINDS[kind], tpl = $(k.tpl), box = $(k.list);
   for (let i = 0; i < k.count; i++) {
@@ -171,6 +182,7 @@ function buildShapeCards(kind) {
     el.dataset.index = i;
     el.classList.add('absent'); // hidden until loaded
     if (kind === 'zone') el.classList.add('zone-color-' + i); // --zc for swatch and selection outline
+    if (kind === 'exclusion') $('.shape-title', el).textContent = exclusionName(i);
     box.appendChild(card);
   }
 }
@@ -178,17 +190,26 @@ const cardsOf = kind => $$(`.shape-card[data-kind="${kind}"]`);
 const shapeCard = (kind, i) => $(`.shape-card[data-kind="${kind}"][data-index="${i}"]`);
 const coordInput = (card, k) => $(`.shape-coord[data-key="${k}"]`, card);
 const sectionOf = kind => sections[KINDS[kind].section];
-const savedShapes = kind => kind === 'zone' ? zonesConfig : objectsConfig;
+const savedShapes = kind => ({ zone: zonesConfig, exclusion: exclusionsConfig, object: objectsConfig })[kind];
+function setSavedShapes(kind, list) {
+  if (kind === 'zone') zonesConfig = list;
+  else if (kind === 'exclusion') exclusionsConfig = list;
+  else objectsConfig = list;
+}
+const regionFilterOn = () => $('#region-filter-enabled').checked;
 
 // A slot is in use (present) as long as its card is not marked "absent".
 const isPresent = card => !card.classList.contains('absent');
 // Reads one card without validation; empty coordinates become NaN.
 function readShape(card) {
-  const present = isPresent(card);
-  const s = { id: +card.dataset.index, name: $('.shape-name', card).value.trim(), present };
+  const present = isPresent(card), id = +card.dataset.index;
+  const nameInput = $('.shape-name', card);
+  const s = { id, name: nameInput ? nameInput.value.trim() : exclusionName(id), present };
   if (card.dataset.kind === 'zone') {
     s.enabled = present && $('.zone-enabled', card).checked;
     s.min_resolution = +$('.zone-min-resolution', card).value || 0;
+  } else if (card.dataset.kind === 'exclusion') {
+    s.enabled = present && regionFilterOn();
   } else {
     s.type = $('.object-type', card).value;
     s.rotation_deg = +$('.object-rotation', card).value;
@@ -203,15 +224,16 @@ function readShape(card) {
 const readShapes = kind => cardsOf(kind).map(readShape);
 const readZones = () => readShapes('zone');
 const readObjects = () => readShapes('object');
+const readExclusions = () => readShapes('exclusion');
 function writeRect(card, r) {
   COORDS.forEach(k => { coordInput(card, k).value = r[k]; });
 }
 function collectShapes(kind) {
-  const list = readShapes(kind), label = KINDS[kind].label;
+  const list = readShapes(kind), label = KINDS[kind].label, named = !KINDS[kind].unnamed;
   list.forEach((s, i) => {
     if (!s.present) return; // deleted slot: name/geometry are ignored by the firmware
-    if (!s.name) throw new Error(`${label} ${i + 1}: name is missing`);
-    if (utf8Len(s.name) > NAME_MAX) throw new Error(`${label} ${i + 1}: name must be at most ${NAME_MAX} bytes`);
+    if (named && !s.name) throw new Error(`${label} ${i + 1}: name is missing`);
+    if (named && utf8Len(s.name) > NAME_MAX) throw new Error(`${label} ${i + 1}: name must be at most ${NAME_MAX} bytes`);
     COORDS.forEach(k => {
       const lo = k[0] === 'x' ? MAP.xMin : MAP.yMin, hi = k[0] === 'x' ? MAP.xMax : MAP.yMax;
       if (!Number.isInteger(s[k]) || s[k] < lo || s[k] > hi) {
@@ -225,6 +247,18 @@ function collectShapes(kind) {
 }
 const collectZones = () => collectShapes('zone');
 const collectObjects = () => collectShapes('object');
+function collectRegionFilter() {
+  return {
+    mode: regionFilterOn() ? REGION_FILTER_EXCLUDE : REGION_FILTER_OFF,
+    regions: collectShapes('exclusion').map(({ id, present, x1, y1, x2, y2 }) => ({ id, present, x1, y1, x2, y2 }))
+  };
+}
+// /api/region-filter response -> shape list in the same form as readExclusions(), or null.
+const regionFilterList = res => res && Array.isArray(res.regions)
+  ? res.regions.map((r, i) => Object.assign({}, r, {
+    name: exclusionName(i), enabled: res.mode === REGION_FILTER_EXCLUDE && !!r.present
+  }))
+  : null;
 
 // Orders and clamps a span to [lo, hi] with at least MIN_SHAPE_MM between both ends.
 function normSpan(a, b, lo, hi) {
@@ -269,11 +303,13 @@ function rotateObjectCard(card) {
 }
 
 function refreshEditorUi() {
-  const zones = readZones(), objects = readObjects();
+  const zones = readZones(), objects = readObjects(), exclusions = readExclusions();
   cardsOf('zone').forEach((c, i) => c.classList.toggle('off', !zones[i].enabled));
+  cardsOf('exclusion').forEach((c, i) => c.classList.toggle('off', !exclusions[i].enabled));
   $('#btn-zone-add').disabled = zones.every(z => z.present);
+  $('#btn-exclusion-add').disabled = exclusions.every(r => r.present);
   $('#btn-object-add').disabled = objects.every(o => o.present);
-  drawShapes(editorMap, zones, objects, lastPresence);
+  drawShapes(editorMap, zones, objects, lastPresence, exclusions);
 }
 function setObjectFields(card, type, rot) {
   $('.object-type', card).value = OBJECT_TYPES[type] ? type : 'other';
@@ -286,26 +322,38 @@ function renderShapes(kind, list) {
   // api()'s comment). Throwing here (instead of adopting `null`) keeps the last-known-good
   // zonesConfig/objectsConfig intact and lets the caller's own error indicator show it.
   if (!Array.isArray(list)) throw new Error('empty response');
-  if (kind === 'zone') zonesConfig = list; else objectsConfig = list;
+  setSavedShapes(kind, list);
   cardsOf(kind).forEach((c, i) => {
     const s = list[i] || {};
     c.classList.toggle('absent', !s.present);
-    $('.shape-name', c).value = s.name || '';
+    if (kind !== 'exclusion') $('.shape-name', c).value = s.name || '';
     if (kind === 'zone') {
       $('.zone-enabled', c).checked = !!s.enabled;
       $('.zone-min-resolution', c).value = s.min_resolution ?? 0;
-    } else setObjectFields(c, s.type, s.rotation_deg);
+    } else if (kind === 'object') setObjectFields(c, s.type, s.rotation_deg);
     COORDS.forEach(k => { coordInput(c, k).value = s[k] ?? ''; });
   });
   refreshEditorUi();
-  drawShapes(statusMap, zonesConfig, objectsConfig, lastPresence);
+  drawShapes(statusMap, zonesConfig, objectsConfig, lastPresence, exclusionsConfig);
 }
 const renderZones = list => renderShapes('zone', list);
 const renderObjects = list => renderShapes('object', list);
+// The toggle is set first: renderShapes() -> refreshEditorUi() reads it for the "off" styling.
+function renderRegionFilter(res) {
+  const list = regionFilterList(res);
+  if (!list) throw new Error('empty response');
+  setChk('region-filter-enabled', res.mode === REGION_FILTER_EXCLUDE);
+  renderShapes('exclusion', list);
+  // Outcome of the boot-time upload; changes reach the radar only with the next boot.
+  setText('region-filter-status', !res.sensor_sent
+    ? 'Not sent to the radar at this boot (simulation on or radar disabled). The simulation applies them right away.'
+    : res.sensor_acked ? 'Confirmed by the radar at boot.'
+      : 'The radar did not confirm the exclusion zones at boot – see the event log.');
+}
 function selectShape(kind, i) {
   const match = el => el.dataset.kind === kind && +el.dataset.index === i;
   $$('.shape-card').forEach(c => c.classList.toggle('selected', match(c)));
-  [...editorMap.zones, ...editorMap.objects].forEach(ms => ms.g.classList.toggle('selected', match(ms.g)));
+  [...editorMap.zones, ...editorMap.exclusions, ...editorMap.objects].forEach(ms => ms.g.classList.toggle('selected', match(ms.g)));
 }
 // Takes the first free slot, gives it a default name/rectangle and saves right away.
 function addShape(kind) {
@@ -313,11 +361,13 @@ function addShape(kind) {
   if (!card) return;
   const i = +card.dataset.index;
   card.classList.remove('absent');
-  $('.shape-name', card).value = KINDS[kind].label + ' ' + (i + 1);
+  if (kind !== 'exclusion') $('.shape-name', card).value = KINDS[kind].label + ' ' + (i + 1);
   if (kind === 'zone') {
     $('.zone-enabled', card).checked = false;
     $('.zone-min-resolution', card).value = 0;
     writeRect(card, NEW_ZONE_RECT);
+  } else if (kind === 'exclusion') {
+    writeRect(card, newExclusionRect(i));
   } else {
     setObjectFields(card, 'other', 0);
     writeRect(card, newObjectRect(i));
@@ -329,7 +379,7 @@ function addShape(kind) {
 // Frees the slot (present=false); for a zone the firmware also removes its HA entity.
 function deleteShape(card) {
   const kind = card.dataset.kind, label = KINDS[kind].label;
-  if (!confirm(`Delete ${label.toLowerCase()} "${$('.shape-name', card).value.trim() || +card.dataset.index + 1}"?`)) return;
+  if (!confirm(`Delete ${label.toLowerCase()} "${readShape(card).name || +card.dataset.index + 1}"?`)) return;
   card.classList.add('absent');
   card.classList.remove('selected');
   if (kind === 'zone') $('.zone-enabled', card).checked = false;
@@ -378,10 +428,15 @@ function buildShape(layer, kind, i, editable) {
   return ms;
 }
 
-// Builds the static layers (field, FOV, 1 m grid, sensor), one group per zone and object
-// (objects above the zones, so they stay draggable inside a zone) and one marker per target.
+// Builds the static layers (field, FOV, 1 m grid, sensor), one group per zone, exclusion zone
+// and object (exclusions above the zones and objects on top, so the smaller shapes stay
+// draggable inside a larger one) and one marker per target.
 function buildMap(svg, editable) {
-  const m = { svg, zones: [], objects: [], targets: [] };
+  const m = { svg, zones: [], exclusions: [], objects: [], targets: [] };
+  // Diagonal hatching of the exclusion zones; the id is per map (two maps share the page)
+  const hatch = svgEl('pattern', { id: svg.id + '-hatch', width: 160, height: 160, patternUnits: 'userSpaceOnUse',
+    patternTransform: 'rotate(45)' }, svgEl('defs', {}, svg));
+  svgEl('line', { class: 'exclusion-hatch', x1: 0, y1: 0, x2: 0, y2: 160 }, hatch);
   svgEl('rect', { class: 'map-field', x: MAP.xMin, y: MAP.yMin, width: MAP.xMax - MAP.xMin, height: MAP.yMax - MAP.yMin }, svg);
   // LD2450 field of view: +-60 deg azimuth up to 6 m
   const r = MAP.yMax, fx = Math.round(r * Math.sin(Math.PI / 3)), fy = Math.round(r * Math.cos(Math.PI / 3));
@@ -396,8 +451,13 @@ function buildMap(svg, editable) {
     svgEl('line', { x1: MAP.xMin, y1: y, x2: MAP.xMax, y2: y }, grid);
     if (y) svgEl('text', { x: 80, y: y - 60 }, grid).textContent = y / 1000 + ' m';
   }
-  const zoneLayer = svgEl('g', {}, svg), objectLayer = svgEl('g', {}, svg);
+  const zoneLayer = svgEl('g', {}, svg), exclusionLayer = svgEl('g', {}, svg), objectLayer = svgEl('g', {}, svg);
   for (let i = 0; i < ZONES; i++) m.zones.push(buildShape(zoneLayer, 'zone', i, editable));
+  for (let i = 0; i < EXCLUSIONS; i++) {
+    const ms = buildShape(exclusionLayer, 'exclusion', i, editable);
+    ms.rect.setAttribute('fill', `url(#${hatch.id})`);
+    m.exclusions.push(ms);
+  }
   for (let i = 0; i < OBJECTS; i++) m.objects.push(buildShape(objectLayer, 'object', i, editable));
   const targetLayer = svgEl('g', {}, svg);
   for (let t = 0; t < TARGETS; t++) {
@@ -421,7 +481,7 @@ function scaleMap(m) {
   if (!k) return; // tab hidden
   const handlePx = isCoarse() ? 13 : 8;
   m.svg.style.fontSize = Math.round(11 * k) + 'px'; // px inside SVG = user units
-  [...m.zones, ...m.objects].forEach(ms => ms.handles.forEach(hd => hd.setAttribute('r', Math.round(handlePx * k))));
+  [...m.zones, ...m.exclusions, ...m.objects].forEach(ms => ms.handles.forEach(hd => hd.setAttribute('r', Math.round(handlePx * k))));
   m.targets.forEach(c => c.setAttribute('r', Math.round(7 * k)));
 }
 const scaleMaps = () => [statusMap, editorMap].forEach(scaleMap);
@@ -438,12 +498,17 @@ function drawShape(ms, s) {
   ms.handles.forEach((hd, c) => setAttrs(hd, { cx: pts[c][0], cy: pts[c][1] }));
   return r;
 }
-function drawShapes(m, zones, objects, presence) {
+function drawShapes(m, zones, objects, presence, exclusions) {
   m.zones.forEach((ms, i) => {
     const z = zones[i] || {};
     ms.g.classList.toggle('off', !z.enabled);
     ms.g.classList.toggle('active', !!z.enabled && presence[i] === true);
     drawShape(ms, z);
+  });
+  m.exclusions.forEach((ms, i) => {
+    const r = exclusions[i] || {};
+    ms.g.classList.toggle('off', !r.enabled);
+    drawShape(ms, r);
   });
   m.objects.forEach((ms, i) => {
     const o = objects[i] || {}, r = drawShape(ms, o);
@@ -473,10 +538,10 @@ function drawTargets(m, targets) {
   });
 }
 
-// Rectangles of all present zones and objects except the dragged one (all shapes dock to each other).
+// Rectangles of all present shapes except the dragged one (all shapes dock to each other).
 function otherRects(kind, index) {
   const rects = [];
-  [['zone', readZones()], ['object', readObjects()]].forEach(([k, list]) => list.forEach((s, j) => {
+  [['zone', readZones()], ['exclusion', readExclusions()], ['object', readObjects()]].forEach(([k, list]) => list.forEach((s, j) => {
     const r = s.present && !(k === kind && j === index) && normRect(s);
     if (r) rects.push(r);
   }));
@@ -701,6 +766,10 @@ const sections = {
   ld2450: { tab: 'ld2450', path: '/api/config/ld2450', ind: 'ld-save-indicator', render: renderLd, collect: collectLd,
     pins: { prefix: 'ld', keys: ['rx_pin', 'tx_pin'] } },
   zones: { tab: 'zones', root: '#zone-list', kind: 'zone', path: '/api/zones', ind: 'zones-save-indicator', render: renderZones, collect: collectZones },
+  // list: extracts the shape list from the response (the other shape sections return a plain array)
+  regionFilter: { tab: 'zones', root: '#region-filter-section', kind: 'exclusion', path: '/api/region-filter',
+    ind: 'region-filter-save-indicator', render: renderRegionFilter, collect: collectRegionFilter, list: regionFilterList,
+    restart: 'Reboot the device now to send the exclusion zones to the radar?' },
   objects: { tab: 'zones', root: '#object-list', kind: 'object', path: '/api/objects', ind: 'objects-save-indicator', render: renderObjects, collect: collectObjects },
   light: { tab: 'light', path: '/api/config/bh1750', ind: 'bh-save-indicator', render: renderBh, collect: collectBh,
     pins: { prefix: 'bh', keys: ['sda_pin', 'scl_pin'] } },
@@ -737,9 +806,10 @@ async function save(sec) {
     const res = await apiPost(sec.path, body);
     if (sec.kind) {
       // See renderShapes(): a 200 with an empty/unparsable body comes back as `res === null`.
-      if (!Array.isArray(res)) throw new Error('empty response');
-      if (sec.kind === 'zone') zonesConfig = res; else objectsConfig = res;
-      drawShapes(statusMap, zonesConfig, objectsConfig, lastPresence);
+      const list = sec.list ? sec.list(res) : res;
+      if (!Array.isArray(list)) throw new Error('empty response');
+      setSavedShapes(sec.kind, list);
+      drawShapes(statusMap, zonesConfig, objectsConfig, lastPresence, exclusionsConfig);
     }
     if (!sec.again && !sec.timer && !applyRestartStatus(sec, res, true)) setIndicator(sec, 'ok', 'Saved ✓');
   } catch (e) {
@@ -898,11 +968,11 @@ function renderState(s) {
     setText('stat-illuminance', lux);
     setText('stat-sim-ld2450', SIM_TEXT[sensorSource(l)]);
     setText('stat-sim-bh1750', SIM_TEXT[sensorSource(b)]);
-    drawShapes(statusMap, zonesConfig, objectsConfig, lastPresence);
+    drawShapes(statusMap, zonesConfig, objectsConfig, lastPresence, exclusionsConfig);
     drawTargets(statusMap, lastTargets);
     renderZoneStatusList();
   } else if (activeTab === 'zones') {
-    drawShapes(editorMap, readZones(), readObjects(), lastPresence);
+    drawShapes(editorMap, readZones(), readObjects(), lastPresence, readExclusions());
     drawTargets(editorMap, lastTargets);
   } else if (activeTab === 'system') {
     setText('sys-uptime', fmtUptime(s.uptime_s));
@@ -1262,6 +1332,7 @@ async function startOta() {
 
 // ---------- Init ----------
 buildShapeCards('zone');
+buildShapeCards('exclusion');
 buildShapeCards('object');
 buildPinSelects();
 editorMap = buildMap($('#zone-map'), true);
@@ -1277,6 +1348,7 @@ $('#tab-zones').addEventListener('click', e => {
   if (del) deleteShape(del.closest('.shape-card'));
 });
 $('#btn-zone-add').addEventListener('click', () => addShape('zone'));
+$('#btn-exclusion-add').addEventListener('click', () => addShape('exclusion'));
 $('#btn-object-add').addEventListener('click', () => addShape('object'));
 $('#btn-reboot').addEventListener('click', () =>
   deviceAction('/api/reboot', 'Reboot the device now?'));
@@ -1302,12 +1374,13 @@ $('#btn-ota-start').addEventListener('click', startOta);
 window.addEventListener('beforeunload', e => { if (otaBusy) e.preventDefault(); });
 window.addEventListener('resize', scaleMaps);
 scaleMaps();
-// Zone + object config is also needed for the status map and zone list.
+// Zone, exclusion zone + object config is also needed for the status map and zone list.
 // One after another instead of in parallel: the device accepts only 4 connections at
 // once (web_server.cpp, MAX_HTTP_CONNECTIONS), each additional one waits ~1 s for the
 // TCP retransmit - and every parallel response costs heap.
 (async () => {
   await loadSection('zones');
+  await loadSection('regionFilter');
   await loadSection('objects');
   await loadState();
   await loadEvents();

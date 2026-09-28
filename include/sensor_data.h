@@ -37,6 +37,10 @@ struct SensorState {
     bool bh1750SimMode = true;
     unsigned long ld2450LastUpdateMs = 0; // millis() of the last actual data update
     unsigned long bh1750LastUpdateMs = 0;
+    // Boot-time region filter upload (sensorsBegin): attempted at all (real sensor
+    // enabled, simulation off, usable pins) and confirmed by the sensor's ACKs.
+    bool ld2450RegionFilterSent = false;
+    bool ld2450RegionFilterAcked = false;
 };
 
 extern SensorState g_sensorState;

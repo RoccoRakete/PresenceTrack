@@ -10,7 +10,7 @@ static uint32_t s_nextId = 1;
 static const char *const EVENT_TYPE_NAMES[] = {
     "presence_changed", "zone_enter", "zone_exit", "mqtt_connected",
     "mqtt_disconnected", "config_changed", "reboot", "factory_reset", "ota_update",
-    "network",
+    "network", "sensor",
 };
 
 static const char *eventTypeToString(EventType type) {

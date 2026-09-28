@@ -145,6 +145,189 @@ static void ld2450UartBegin(const AppConfig &cfg) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LD2450 command channel (HLK-LD2450 Serial Communication Protocol V1.02/V1.03,
+// sections 2.1.2 and 2.2), separate from the report frames above:
+//   FD FC FB FA | length (2 B LE, command word + value) | command word (2 B LE) | value | 04 03 02 01
+// The ACK uses the same framing; its command word is the sent one | 0x0100
+// (e.g. FF 01 for 0x00FF), followed by a 2-byte LE status (0 = success) and
+// optional return data. Every command except "enable configuration" is only
+// accepted between "enable" and "end configuration"; in between the sensor
+// sends no report frames. Blocking, only used once from sensorsBegin().
+// ---------------------------------------------------------------------------
+static const uint8_t LD2450_CMD_HEADER[] = {0xFD, 0xFC, 0xFB, 0xFA};
+static const uint8_t LD2450_CMD_FOOTER[] = {0x04, 0x03, 0x02, 0x01};
+static const uint16_t LD2450_CMD_ENABLE_CONFIG = 0x00FF;
+static const uint16_t LD2450_CMD_END_CONFIG = 0x00FE;
+static const uint16_t LD2450_CMD_SET_REGION_FILTER = 0x00C2;
+static const uint16_t LD2450_ACK_FLAG = 0x0100;
+static const unsigned long LD2450_ACK_TIMEOUT_MS = 200;
+static const uint8_t LD2450_CMD_ATTEMPTS = 2;      // first try + 1 retry
+static const uint8_t LD2450_ACK_MAX_DATA = 32;     // headroom above the longest ACK used here (8 bytes)
+// Region filter value: 2-byte filter type + 3 regions x 4 int16 coordinates
+static const uint8_t LD2450_REGION_BYTES = 8;
+static const uint8_t LD2450_REGION_FILTER_VALUE_BYTES = 2 + LD2450_REGION_COUNT * LD2450_REGION_BYTES;
+
+static void writeLe16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void ld2450SendCommand(uint16_t command, const uint8_t *value, uint8_t valueLen) {
+    uint8_t head[sizeof(LD2450_CMD_HEADER) + 4];
+    memcpy(head, LD2450_CMD_HEADER, sizeof(LD2450_CMD_HEADER));
+    writeLe16(head + 4, 2 + valueLen);
+    writeLe16(head + 6, command);
+    s_ld2450Uart->write(head, sizeof(head));
+    if (valueLen > 0) s_ld2450Uart->write(value, valueLen);
+    s_ld2450Uart->write(LD2450_CMD_FOOTER, sizeof(LD2450_CMD_FOOTER));
+    s_ld2450Uart->flush();
+}
+
+enum class Ld2450AckState : uint8_t { WaitHeader, ReadLength, ReadData, WaitFooter };
+
+// Scans the incoming bytes for the ACK of `command` until the timeout; report
+// frames still buffered from before and noise are skipped, as is the late ACK
+// of another command. True only for status 0 (success).
+static bool ld2450WaitAck(uint16_t command) {
+    Ld2450AckState st = Ld2450AckState::WaitHeader;
+    uint8_t data[LD2450_ACK_MAX_DATA];
+    uint8_t pos = 0;
+    uint16_t len = 0;
+    const unsigned long start = millis();
+    while (millis() - start < LD2450_ACK_TIMEOUT_MS) {
+        if (s_ld2450Uart->available() <= 0) {
+            delay(1); // feeds the watchdog and lets the Wi-Fi stack run
+            continue;
+        }
+        uint8_t b = (uint8_t)s_ld2450Uart->read();
+        switch (st) {
+            case Ld2450AckState::WaitHeader:
+                // Same resync rule as matchLd2450Header()
+                if (b == LD2450_CMD_HEADER[pos]) {
+                    pos++;
+                } else {
+                    pos = b == LD2450_CMD_HEADER[0] ? 1 : 0;
+                }
+                if (pos == sizeof(LD2450_CMD_HEADER)) {
+                    st = Ld2450AckState::ReadLength;
+                    pos = 0;
+                    len = 0;
+                }
+                break;
+            case Ld2450AckState::ReadLength:
+                len |= (uint16_t)b << (8 * pos);
+                if (++pos == 2) {
+                    // Command word + status at least; anything longer than any ACK used here is garbage
+                    bool plausible = len >= 4 && len <= LD2450_ACK_MAX_DATA;
+                    st = plausible ? Ld2450AckState::ReadData : Ld2450AckState::WaitHeader;
+                    pos = 0;
+                }
+                break;
+            case Ld2450AckState::ReadData:
+                data[pos++] = b;
+                if (pos == len) {
+                    st = Ld2450AckState::WaitFooter;
+                    pos = 0;
+                }
+                break;
+            case Ld2450AckState::WaitFooter:
+                if (b != LD2450_CMD_FOOTER[pos]) {
+                    st = Ld2450AckState::WaitHeader;
+                    pos = b == LD2450_CMD_HEADER[0] ? 1 : 0;
+                    break;
+                }
+                if (++pos == sizeof(LD2450_CMD_FOOTER)) {
+                    uint16_t word = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+                    uint16_t status = (uint16_t)data[2] | ((uint16_t)data[3] << 8);
+                    if (word == (command | LD2450_ACK_FLAG)) return status == 0;
+                    st = Ld2450AckState::WaitHeader;
+                    pos = 0;
+                }
+                break;
+        }
+    }
+    return false;
+}
+
+// Sends a command and waits for its ACK; one retry after a timeout or failure status.
+static bool ld2450Command(uint16_t command, const uint8_t *value, uint8_t valueLen) {
+    for (uint8_t attempt = 0; attempt < LD2450_CMD_ATTEMPTS; attempt++) {
+        ld2450SendCommand(command, value, valueLen);
+        if (ld2450WaitAck(command)) return true;
+    }
+    return false;
+}
+
+static bool ld2450EnterConfigMode() {
+    static const uint8_t value[] = {0x01, 0x00};
+    return ld2450Command(LD2450_CMD_ENABLE_CONFIG, value, sizeof(value));
+}
+
+static bool ld2450ExitConfigMode() {
+    return ld2450Command(LD2450_CMD_END_CONFIG, nullptr, 0);
+}
+
+// Coordinates are plain two's complement int16 LE here, NOT the sign-magnitude
+// format of the report frames (decodeLd2450Signed): the datasheet example for
+// 0x00C2 encodes x = -1000 as 18 FC (0xFC18), and the query reply 0x00C1 as
+// well as ESPHome's ld2450 component use the same encoding. Still to be
+// verified against a real sensor (e.g. read back with 0x00C1). An unused
+// region is sent as all zeros, which the sensor treats as "not used".
+static bool ld2450SetRegionFilter(const Ld2450RegionFilterConfig &rf) {
+    uint8_t value[LD2450_REGION_FILTER_VALUE_BYTES] = {0};
+    writeLe16(value, rf.mode); // filter type: 0 = off, 2 = do not detect inside the regions
+    for (uint8_t i = 0; i < LD2450_REGION_COUNT; i++) {
+        if (!rf.present[i]) continue;
+        uint8_t *p = value + 2 + i * LD2450_REGION_BYTES;
+        writeLe16(p, (uint16_t)rf.x1[i]);
+        writeLe16(p + 2, (uint16_t)rf.y1[i]);
+        writeLe16(p + 4, (uint16_t)rf.x2[i]);
+        writeLe16(p + 6, (uint16_t)rf.y2[i]);
+    }
+    return ld2450Command(LD2450_CMD_SET_REGION_FILTER, value, sizeof(value));
+}
+
+// Uploads cfg.ld2450.regionFilter: enable configuration -> set region filter ->
+// end configuration. The sensor keeps the filter across power loss, so it is
+// sent on every boot to keep it in sync with the config, "off" included. Worst
+// case ~1.2 s (enable configuration succeeds, then set filter and end
+// configuration each exhaust 2 attempts x 200 ms) when the sensor stops
+// answering mid-sequence; a failure is logged and the firmware carries on
+// without the filter.
+static void ld2450ApplyRegionFilter(const AppConfig &cfg) {
+    if (!s_ld2450Uart) return; // invalid pins
+    const Ld2450RegionFilterConfig &rf = cfg.ld2450.regionFilter;
+    g_sensorState.ld2450RegionFilterSent = true;
+
+    const char *failedStep = nullptr;
+    if (!ld2450EnterConfigMode()) {
+        failedStep = "enter config";
+    } else if (!ld2450SetRegionFilter(rf)) {
+        failedStep = "set filter";
+    }
+    // Always attempted (the enable ACK may just have been lost): a sensor left in
+    // configuration mode would send no report frames at all.
+    if (!ld2450ExitConfigMode() && !failedStep) failedStep = "end config";
+
+    g_sensorState.ld2450RegionFilterAcked = !failedStep;
+    if (failedStep) {
+        eventLogPush(EventType::Sensor, "Radar exclusion zones failed (%s)", failedStep);
+        if (serialLogEnabled()) Serial.printf("LD2450 region filter failed: no ACK for %s\n", failedStep);
+        return;
+    }
+    uint8_t regions = 0;
+    for (uint8_t i = 0; i < LD2450_REGION_COUNT; i++) {
+        if (rf.present[i]) regions++;
+    }
+    if (rf.mode == REGION_FILTER_EXCLUDE) {
+        eventLogPush(EventType::Sensor, "Radar exclusion zones applied: %u", regions);
+    } else {
+        eventLogPush(EventType::Sensor, "Radar exclusion zones disabled");
+    }
+    if (serialLogEnabled()) Serial.printf("LD2450 region filter sent (mode %u)\n", rf.mode);
+}
+
 // The core's software I2C drives the pins open-drain through the GPIO0-15
 // registers; GPIO16 sits outside them.
 static const char *bh1750PinError(uint8_t sdaPin, uint8_t sclPin) {
@@ -176,6 +359,9 @@ void sensorsBegin(const AppConfig &cfg) {
     // Before the LD2450: its UART0 swap ends the USB serial log.
     bh1750WireBegin(cfg);
     ld2450UartBegin(cfg);
+    if (cfg.ld2450.enabled && !cfg.ld2450.simEnabled) {
+        ld2450ApplyRegionFilter(cfg);
+    }
     randomSeed(micros());
 
     unsigned long now = millis();
@@ -244,6 +430,27 @@ static void moveTarget(SimTarget &t, float maxRange, float dtS) {
     }
 }
 
+static bool targetInRect(const Ld2450Target &t, int16_t x1, int16_t y1, int16_t x2, int16_t y2) {
+    int16_t minX = min(x1, x2);
+    int16_t maxX = max(x1, x2);
+    int16_t minY = min(y1, y2);
+    int16_t maxY = max(y1, y2);
+    return t.xMm >= minX && t.xMm <= maxX && t.yMm >= minY && t.yMm <= maxY;
+}
+
+static bool targetInZone(const Ld2450Target &t, const ZoneConfig &z) {
+    return targetInRect(t, z.x1, z.y1, z.x2, z.y2);
+}
+
+// Simulated counterpart of the sensor's own region filter (exclusion mode only).
+static bool targetExcluded(const Ld2450Target &t, const Ld2450RegionFilterConfig &rf) {
+    if (rf.mode != REGION_FILTER_EXCLUDE) return false;
+    for (uint8_t i = 0; i < LD2450_REGION_COUNT; i++) {
+        if (rf.present[i] && targetInRect(t, rf.x1[i], rf.y1[i], rf.x2[i], rf.y2[i])) return true;
+    }
+    return false;
+}
+
 // Stateful simulation of up to three moving targets, so that the zone map in
 // the web UI and the Home Assistant entities can be tested without hardware.
 // The real driver (pollLd2450Uart) fills the same state.targets[].
@@ -280,6 +487,9 @@ static void simulateLd2450Targets(const AppConfig &cfg, unsigned long now, float
         float res = SIM_RES_NEAR - (SIM_RES_NEAR - SIM_RES_FAR) * rangeFrac +
                     randomFloat(-SIM_RES_NOISE, SIM_RES_NOISE);
         out.resolution = (uint16_t)lroundf(constrain(res, 0.0f, 65535.0f));
+        // Like the real sensor: a target inside an exclusion region is not reported
+        // at all; the simulated target keeps moving and reappears once it leaves.
+        if (targetExcluded(out, cfg.ld2450.regionFilter)) out = Ld2450Target{};
     }
 }
 
@@ -387,14 +597,6 @@ static bool debouncePresence(bool detected, unsigned long now, unsigned long hol
     }
     seen = false;
     return false;
-}
-
-static bool targetInZone(const Ld2450Target &t, const ZoneConfig &z) {
-    int16_t minX = min(z.x1, z.x2);
-    int16_t maxX = max(z.x1, z.x2);
-    int16_t minY = min(z.y1, z.y2);
-    int16_t maxY = max(z.y1, z.y2);
-    return t.xMm >= minX && t.xMm <= maxX && t.yMm >= minY && t.yMm <= maxY;
 }
 
 // Moving/still per target slot. An inactive slot drops its hold-off, so a

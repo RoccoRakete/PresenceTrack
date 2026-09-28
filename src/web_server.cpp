@@ -599,6 +599,46 @@ static void zonesToJson(const ZoneConfig *zones, JsonDocument &doc) {
     }
 }
 
+// Region filter as the firmware booted with it: it is only sent to the sensor in
+// sensorsBegin(), so any difference means the change reaches the sensor after a restart.
+static Ld2450RegionFilterConfig s_bootRegionFilter;
+
+// Geometry of unused slots is ignored (it is kept as stored, but never sent).
+static bool regionFilterChanged(const Ld2450RegionFilterConfig &a, const Ld2450RegionFilterConfig &b) {
+    if (a.mode != b.mode) return true;
+    for (uint8_t i = 0; i < LD2450_REGION_COUNT; i++) {
+        if (a.present[i] != b.present[i]) return true;
+        if (a.present[i] && (a.x1[i] != b.x1[i] || a.y1[i] != b.y1[i] ||
+                             a.x2[i] != b.x2[i] || a.y2[i] != b.y2[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void regionFilterToJson(const Ld2450RegionFilterConfig &rf, JsonDocument &doc) {
+    doc["mode"] = rf.mode;
+    JsonArray arr = doc["regions"].to<JsonArray>();
+    for (uint8_t i = 0; i < LD2450_REGION_COUNT; i++) {
+        JsonObject r = arr.add<JsonObject>();
+        r["id"] = i;
+        r["present"] = rf.present[i];
+        r["x1"] = rf.x1[i];
+        r["y1"] = rf.y1[i];
+        r["x2"] = rf.x2[i];
+        r["y2"] = rf.y2[i];
+    }
+    // Only while the real sensor is in use (the simulation applies the filter live) and it
+    // does not hold this config yet: changed since boot, or not sent at boot at all
+    // (simulation switched off at runtime). Never with unusable boot pins: a restart cannot help there.
+    const Ld2450Config &ld = s_cfg->ld2450;
+    doc["restart_required"] = ld.enabled && !ld.simEnabled && !ld2450PinError(s_bootPins[0], s_bootPins[1]) &&
+                              (!g_sensorState.ld2450RegionFilterSent || regionFilterChanged(rf, s_bootRegionFilter));
+    // Outcome of the boot-time upload (not sent: simulation, sensor disabled or invalid pins)
+    doc["sensor_sent"] = g_sensorState.ld2450RegionFilterSent;
+    doc["sensor_acked"] = g_sensorState.ld2450RegionFilterAcked;
+}
+
 static void objectsToJson(const RoomObjectConfig *objects, JsonDocument &doc) {
     JsonArray arr = doc.to<JsonArray>();
     for (uint8_t i = 0; i < MAX_OBJECTS; i++) {
@@ -983,6 +1023,87 @@ static void registerZoneRoutes() {
                 return;
             }
             zonesToJson(s_cfg->zones, resp);
+        });
+}
+
+static void registerRegionFilterRoutes() {
+    server.on("/api/region-filter", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument doc;
+        regionFilterToJson(s_cfg->ld2450.regionFilter, doc);
+        sendJsonDoc(request, 200, doc);
+    });
+
+    registerJsonPost(server, "/api/region-filter", MAX_BODY_LEN,
+        [](JsonDocument &body, JsonDocument &resp, AsyncWebServerRequest *request) {
+            if (!requireObject(body, request)) return;
+            JsonObjectConst o = body.as<JsonObjectConst>();
+
+            String err;
+            if (!validateInt(o, "mode", REGION_FILTER_OFF, REGION_FILTER_EXCLUDE, err)) {
+                sendJsonError(request, 400, err);
+                return;
+            }
+            // The sensor's "detect only inside the regions" mode (1) is deliberately not supported
+            if (!o["mode"].isNull() && o["mode"].as<long>() == 1) {
+                sendJsonError(request, 400, "mode must be 0 (off) or 2 (exclusion)");
+                return;
+            }
+
+            // Validate everything first, then apply atomically (same rules as zones)
+            Ld2450RegionFilterConfig next = s_cfg->ld2450.regionFilter;
+            next.mode = o["mode"] | next.mode;
+            if (!o["regions"].isNull()) {
+                if (!o["regions"].is<JsonArrayConst>() || o["regions"].size() != LD2450_REGION_COUNT) {
+                    sendJsonError(request, 400, "regions array must contain exactly 3 entries");
+                    return;
+                }
+                uint8_t i = 0;
+                for (JsonVariantConst v : o["regions"].as<JsonArrayConst>()) {
+                    String prefix = String("regions[") + i + "].";
+                    if (!v.is<JsonObjectConst>()) {
+                        sendJsonError(request, 400, prefix.substring(0, prefix.length() - 1) + " must be an object");
+                        return;
+                    }
+                    JsonObjectConst r = v.as<JsonObjectConst>();
+                    if (!validateBool(r, "present", err)) {
+                        sendJsonError(request, 400, prefix + err);
+                        return;
+                    }
+                    next.present[i] = r["present"] | next.present[i];
+                    if (!next.present[i]) {
+                        // Deleted slot: geometry is ignored and kept as stored
+                        i++;
+                        continue;
+                    }
+                    if (!validateInt(r, "x1", -6000, 6000, err) ||
+                        !validateInt(r, "y1", 0, 6000, err) ||
+                        !validateInt(r, "x2", -6000, 6000, err) ||
+                        !validateInt(r, "y2", 0, 6000, err)) {
+                        sendJsonError(request, 400, prefix + err);
+                        return;
+                    }
+                    next.x1[i] = r["x1"] | next.x1[i];
+                    next.y1[i] = r["y1"] | next.y1[i];
+                    next.x2[i] = r["x2"] | next.x2[i];
+                    next.y2[i] = r["y2"] | next.y2[i];
+                    // Checked on the merged values, so partial updates stay consistent
+                    if (next.x1[i] >= next.x2[i] || next.y1[i] >= next.y2[i]) {
+                        sendJsonError(request, 400, prefix + "x1 must be < x2 and y1 must be < y2");
+                        return;
+                    }
+                    i++;
+                }
+            }
+
+            Ld2450RegionFilterConfig previous = s_cfg->ld2450.regionFilter;
+            s_cfg->ld2450.regionFilter = next;
+
+            // No HA entities; the simulation applies it right away, the sensor after a restart
+            if (!persistAndApply(request, "exclusion zones", false)) {
+                s_cfg->ld2450.regionFilter = previous;
+                return;
+            }
+            regionFilterToJson(s_cfg->ld2450.regionFilter, resp);
         });
 }
 
@@ -1610,6 +1731,7 @@ void webServerBegin(AppConfig &cfg) {
     s_bootPins[2] = cfg.bh1750.sdaPin;
     s_bootPins[3] = cfg.bh1750.sclPin;
     s_bootWifi = cfg.wifi;
+    s_bootRegionFilter = cfg.ld2450.regionFilter;
     IPAddress bootStaticIp;
     s_staticIpFallback = cfg.wifi.useStaticIp &&
                          (!bootStaticIp.fromString(cfg.wifi.staticIp) || WiFi.localIP() != bootStaticIp);
@@ -1620,6 +1742,7 @@ void webServerBegin(AppConfig &cfg) {
     registerHaExposeRoutes();
     registerWifiRoutes();
     registerZoneRoutes();
+    registerRegionFilterRoutes();
     registerObjectRoutes();
     registerStateRoute();
     registerEventRoutes();

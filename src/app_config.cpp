@@ -4,7 +4,7 @@
 
 static const char *CONFIG_PATH = "/config.json";
 static const char *CONFIG_TMP_PATH = "/config.json.tmp";
-static const uint8_t CONFIG_SCHEMA_VERSION = 8; // informational only, not evaluated on load
+static const uint8_t CONFIG_SCHEMA_VERSION = 9; // informational only, not evaluated on load
 
 // Indexed by ObjectType
 static const char *const OBJECT_TYPE_NAMES[OBJECT_TYPE_COUNT] = {
@@ -80,6 +80,19 @@ void AppConfig::toJson(JsonDocument &doc) const {
     ld["moving_threshold_cm_s"] = ld2450.movingThresholdCmS;
     ld["rx_pin"] = ld2450.rxPin;
     ld["tx_pin"] = ld2450.txPin;
+
+    const Ld2450RegionFilterConfig &rf = ld2450.regionFilter;
+    JsonObject rfObj = ld["region_filter"].to<JsonObject>();
+    rfObj["mode"] = rf.mode;
+    JsonArray regionsArr = rfObj["regions"].to<JsonArray>();
+    for (uint8_t i = 0; i < LD2450_REGION_COUNT; i++) {
+        JsonObject r = regionsArr.add<JsonObject>();
+        r["present"] = rf.present[i];
+        r["x1"] = rf.x1[i];
+        r["y1"] = rf.y1[i];
+        r["x2"] = rf.x2[i];
+        r["y2"] = rf.y2[i];
+    }
 
     JsonObject bh = doc["bh1750"].to<JsonObject>();
     bh["enabled"] = bh1750.enabled;
@@ -159,6 +172,27 @@ void AppConfig::fromJson(const JsonDocument &doc) {
         ld2450.movingThresholdCmS = ld["moving_threshold_cm_s"] | ld2450.movingThresholdCmS;
         ld2450.rxPin = ld["rx_pin"] | ld2450.rxPin;
         ld2450.txPin = ld["tx_pin"] | ld2450.txPin;
+
+        // Missing in schema <= 8: region filter off, all slots unused (defaults)
+        if (ld["region_filter"].is<JsonObjectConst>()) {
+            JsonObjectConst rfObj = ld["region_filter"];
+            Ld2450RegionFilterConfig &rf = ld2450.regionFilter;
+            uint8_t mode = rfObj["mode"] | rf.mode;
+            // Only off/exclude are supported; anything else (incl. the sensor's "detect only" mode 1) turns it off
+            rf.mode = mode == REGION_FILTER_EXCLUDE ? REGION_FILTER_EXCLUDE : REGION_FILTER_OFF;
+            if (rfObj["regions"].is<JsonArrayConst>()) {
+                uint8_t i = 0;
+                for (JsonObjectConst r : rfObj["regions"].as<JsonArrayConst>()) {
+                    if (i >= LD2450_REGION_COUNT) break;
+                    rf.present[i] = r["present"] | rf.present[i];
+                    rf.x1[i] = r["x1"] | rf.x1[i];
+                    rf.y1[i] = r["y1"] | rf.y1[i];
+                    rf.x2[i] = r["x2"] | rf.x2[i];
+                    rf.y2[i] = r["y2"] | rf.y2[i];
+                    i++;
+                }
+            }
+        }
     }
 
     if (doc["bh1750"].is<JsonObjectConst>()) {

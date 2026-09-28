@@ -79,13 +79,23 @@
   <div class="card">
     <h2>Zones <span id="zones-save-indicator" class="save-indicator"></span></h2>
     <svg id="zone-map" class="zone-map editable" viewBox="-6000 -300 12000 6600" preserveAspectRatio="xMidYMin meet" role="img" aria-label="Zone editor map"></svg>
-    <p class="muted">Sensor at the top, looking down. Drag a corner to resize a zone or object, drag its body to move it. Grid: 1 m.</p>
+    <p class="muted">Sensor at the top, looking down. Drag a corner to resize a zone, exclusion zone or object, drag its body to move it. Hatched red areas are sensor exclusion zones. Grid: 1 m.</p>
   </div>
   <div class="zone-toolbar">
     <button type="button" id="btn-zone-add" class="btn" disabled>+ Add zone</button>
     <span class="muted">A zone appears in Home Assistant only once it is enabled. Min. signal quality ignores targets with a weaker signal in that zone: a higher value means less sensitive, 0 turns the filter off.</span>
   </div>
   <div id="zone-list" class="grid zones"></div>
+  <div id="region-filter-section">
+    <h2 class="section-title">Sensor exclusion zones <span id="region-filter-save-indicator" class="save-indicator"></span></h2>
+    <div class="zone-toolbar">
+      <button type="button" id="btn-exclusion-add" class="btn" disabled>+ Add exclusion zone</button>
+      <label class="toolbar-switch"><span>Exclusion zones active</span><input type="checkbox" id="region-filter-enabled" class="switch"></label>
+      <span class="muted">Up to 3 areas the radar itself ignores, e.g. a fan or a moving curtain. Targets inside are never reported, so they count neither for presence nor for any zone. The zones are sent to the radar at boot: changes take effect after a restart (with simulation right away).</span>
+    </div>
+    <p class="muted" id="region-filter-status"></p>
+    <div id="exclusion-list" class="grid zones"></div>
+  </div>
   <h2 class="section-title">Objects <span id="objects-save-indicator" class="save-indicator"></span></h2>
   <div class="zone-toolbar">
     <button type="button" id="btn-object-add" class="btn" disabled>+ Add object</button>
@@ -270,6 +280,22 @@
       <label><span>X2 (mm)</span><input type="number" class="shape-coord" data-key="x2" min="-6000" max="6000"></label>
       <label><span>Y2 (mm)</span><input type="number" class="shape-coord" data-key="y2" min="0" max="6000"></label>
       <label><span>Min. signal quality</span><input type="number" class="zone-min-resolution" min="0" max="65535" title="Targets below this signal quality are ignored for this zone. Higher value = less sensitive, 0 = filter off."></label>
+    </div>
+  </div>
+</template>
+
+<template id="exclusion-card-template">
+  <div class="card exclusion-card shape-card">
+    <div class="zone-head">
+      <span class="zone-color-swatch"></span>
+      <span class="shape-title"></span>
+      <button type="button" class="btn icon shape-delete" title="Delete exclusion zone" aria-label="Delete exclusion zone">✕</button>
+    </div>
+    <div class="coord-grid">
+      <label><span>X1 (mm)</span><input type="number" class="shape-coord" data-key="x1" min="-6000" max="6000"></label>
+      <label><span>Y1 (mm)</span><input type="number" class="shape-coord" data-key="y1" min="0" max="6000"></label>
+      <label><span>X2 (mm)</span><input type="number" class="shape-coord" data-key="x2" min="-6000" max="6000"></label>
+      <label><span>Y2 (mm)</span><input type="number" class="shape-coord" data-key="y2" min="0" max="6000"></label>
     </div>
   </div>
 </template>

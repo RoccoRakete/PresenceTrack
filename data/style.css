@@ -18,6 +18,7 @@
   --target-color-1: #ffffff;
   --target-color-2: #00e5d4;
   --object-color: #9aa4b2;
+  --exclusion-color: var(--danger);
 }
 * { box-sizing: border-box; }
 body {
@@ -120,6 +121,7 @@ input:invalid { border-color: var(--danger); }
 .target-1 { --tc: var(--target-color-1); }
 .target-2 { --tc: var(--target-color-2); }
 .object-card, .map-object { --zc: var(--object-color); }
+.exclusion-card, .map-exclusion { --zc: var(--exclusion-color); }
 
 /* Zone map (SVG, 1 user unit = 1 mm). Stroke widths stay in screen px. */
 .zone-map { display: block; width: 100%; height: auto; margin-top: 12px; user-select: none; -webkit-user-select: none; }
@@ -140,13 +142,20 @@ input:invalid { border-color: var(--danger); }
 .zone-map.mini .map-zone.off { display: none; }
 .map-zone.selected .zone-rect { stroke-width: 3; }
 .zone-label { fill: var(--zc); font-weight: 600; pointer-events: none; }
+/* Sensor exclusion zones: hatched (fill set to the map's pattern in app.js) with a dashed outline */
+.exclusion-hatch { stroke: var(--exclusion-color); stroke-opacity: .45; stroke-width: 1.5; }
+.exclusion-rect { stroke: var(--exclusion-color); stroke-width: 2; stroke-dasharray: 8 5; }
+.map-exclusion.off { opacity: .4; }
+.zone-map.mini .map-exclusion.off { display: none; }
+.map-exclusion.selected .exclusion-rect { stroke-width: 3; }
+.exclusion-label { fill: var(--exclusion-color); font-weight: 600; pointer-events: none; }
 .map-object .object-rect { fill: var(--object-color); fill-opacity: .25; stroke: var(--object-color); stroke-width: 1.5; stroke-dasharray: 3 3; }
 .map-object.selected .object-rect { stroke-width: 3; }
 .object-arrow { fill: var(--object-color); fill-opacity: .7; pointer-events: none; }
 .object-label, .object-type-label { fill: var(--object-color); pointer-events: none; }
 .object-label { font-weight: 600; }
 .zone-map.mini .object-type-label { display: none; }
-.editable .zone-rect, .editable .object-rect { cursor: move; }
+.editable .zone-rect, .editable .exclusion-rect, .editable .object-rect { cursor: move; }
 .shape-handle { fill: var(--card-bg); stroke: var(--zc); stroke-width: 2; cursor: nwse-resize; }
 .shape-handle[data-corner="1"], .shape-handle[data-corner="3"] { cursor: nesw-resize; }
 .map-target { fill: var(--tc); stroke: var(--bg); stroke-width: 2; pointer-events: none; transition: transform 1.8s linear; }
@@ -156,12 +165,14 @@ input:invalid { border-color: var(--danger); }
 
 .zone-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 .zone-head .shape-name { flex: 1; width: auto; min-width: 0; max-width: none; }
+.zone-head .shape-title { flex: 1; font-weight: 600; }
 .zone-color-swatch { width: 14px; height: 14px; border-radius: 50%; flex: none; background: var(--zc); }
 .shape-card.absent { display: none; }
-.zone-card.off { opacity: .6; }
+.zone-card.off, .exclusion-card.off { opacity: .6; }
 .zone-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .zone-toolbar .muted { margin: 0; }
-#btn-zone-add:not(:disabled), #btn-object-add:not(:disabled) { background: var(--accent); color: #051320; font-weight: 600; }
+.toolbar-switch { display: flex; align-items: center; gap: 8px; }
+#btn-zone-add:not(:disabled), #btn-exclusion-add:not(:disabled), #btn-object-add:not(:disabled) { background: var(--accent); color: #051320; font-weight: 600; }
 .shape-card.selected { box-shadow: 0 0 0 2px var(--zc), 0 2px 10px rgba(0,0,0,.35); }
 .section-title { margin: 24px 4px 12px; }
 .coord-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; padding-top: 10px; border-top: 1px solid var(--line); }
@@ -182,7 +193,7 @@ input:invalid { border-color: var(--danger); }
 .ev-zone_enter .event-type, .ev-mqtt_connected .event-type { color: var(--ok); }
 .ev-zone_exit .event-type, .ev-mqtt_disconnected .event-type { color: var(--warn); }
 .ev-reboot .event-type, .ev-factory_reset .event-type { color: var(--danger); }
-.ev-ota_update .event-type { color: var(--warn); }
+.ev-ota_update .event-type, .ev-sensor .event-type { color: var(--warn); }
 .event-msg { overflow-wrap: anywhere; }
 
 /* Firmware tab: file inputs, step list and upload progress of an OTA run */
