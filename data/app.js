@@ -1035,7 +1035,7 @@ async function loadSystem() {
     setText('fw-fs-size', fmtBytes(s.fs_size_bytes));
     systemInfo = s;
     systemLoaded = true;
-    refreshOtaHints();
+    refreshOtaHint();
   } catch (e) { /* keep placeholders */ }
 }
 
@@ -1114,6 +1114,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Both files are called *.bin, so they are easy to mix up: tell them apart by their
 // first bytes (0xE9/gzip = ESP8266 image, "littlefs" at offset 8 = LittleFS superblock).
+// This is also what assigns the files of the single multi-select input to their step.
 async function sniffOtaFile(file) {
   const b = new Uint8Array(await file.slice(0, 16).arrayBuffer());
   if (b.length >= 16 && new TextDecoder().decode(b.subarray(8, 16)) === 'littlefs') return 'filesystem';
@@ -1121,36 +1122,51 @@ async function sniffOtaFile(file) {
   return null;
 }
 
-// -> { ok, text } for the hint below the file input. The device re-checks everything;
+// -> { ok, text } for one recognized file. The device re-checks everything;
 // this only saves a doomed upload (and, for the image, it runs before any flash write).
-async function checkOtaFile(kind, file) {
-  const type = await sniffOtaFile(file);
+function checkOtaFile(kind, file) {
   const size = fmtBytes(file.size);
   if (kind === 'firmware') {
-    if (type !== 'firmware') return { ok: false, text: `${file.name}: not an ESP8266 firmware${type === 'filesystem' ? ' (this is a filesystem image)' : ''}.` };
     const max = systemInfo && systemInfo.ota_max_firmware_bytes;
-    if (!max) return { ok: true, text: `${file.name}: ${size} (free space on the device not known yet).` };
+    if (!max) return { ok: true, text: `${file.name}: firmware, ${size} (free space on the device not known yet).` };
     return file.size <= max
-      ? { ok: true, text: `${file.name}: ${size} - fits (max. ${fmtBytes(max)}).` }
-      : { ok: false, text: `${file.name}: ${size} - too large, the OTA space holds only ${fmtBytes(max)}.` };
+      ? { ok: true, text: `${file.name}: firmware, ${size} - fits (max. ${fmtBytes(max)}).` }
+      : { ok: false, text: `${file.name}: firmware, ${size} - too large, the OTA space holds only ${fmtBytes(max)}.` };
   }
-  if (type !== 'filesystem') return { ok: false, text: `${file.name}: not a LittleFS image${type === 'firmware' ? ' (this is a firmware file)' : ''}.` };
   const fsSize = systemInfo && systemInfo.fs_size_bytes;
-  if (!fsSize) return { ok: true, text: `${file.name}: ${size} (partition size not known yet).` };
+  if (!fsSize) return { ok: true, text: `${file.name}: filesystem image, ${size} (partition size not known yet).` };
   return file.size === fsSize
-    ? { ok: true, text: `${file.name}: ${size} - fits the filesystem partition exactly.` }
-    : { ok: false, text: `${file.name}: ${size} - does not fit, the partition is ${fmtBytes(fsSize)} (different flash layout?).` };
+    ? { ok: true, text: `${file.name}: filesystem image, ${size} - fits the filesystem partition exactly.` }
+    : { ok: false, text: `${file.name}: filesystem image, ${size} - does not fit, the partition is ${fmtBytes(fsSize)} (different flash layout?).` };
 }
 
-async function refreshOtaHint(kind) {
-  const file = $(`#ota-${kind === 'firmware' ? 'fw' : 'fs'}-file`).files[0];
-  const hint = $(`#ota-${kind === 'firmware' ? 'fw' : 'fs'}-hint`);
-  const r = file ? await checkOtaFile(kind, file) : { ok: true, text: '' };
-  hint.textContent = r.text;
+// Sorts the selected files into firmware/filesystem by content and checks each one.
+// -> { fw, fs, ok, checks: [{ ok, text }] }; ok is false for an unknown file, two
+// files of the same kind or a failed size check, so a run never starts half-guessed.
+async function classifyOtaFiles(files) {
+  const r = { fw: null, fs: null, ok: true, checks: [] };
+  const fail = text => { r.ok = false; r.checks.push({ ok: false, text }); };
+  if (files.length > 2) fail(`${files.length} files selected - choose at most one firmware and one filesystem image.`);
+  for (const file of files) {
+    const kind = await sniffOtaFile(file);
+    if (!kind) { fail(`${file.name}: neither an ESP8266 firmware nor a LittleFS image.`); continue; }
+    const slot = kind === 'firmware' ? 'fw' : 'fs';
+    if (r[slot]) { fail(`${file.name}: a second ${kind === 'firmware' ? 'firmware' : 'filesystem image'} (${r[slot].name} is already selected).`); continue; }
+    r[slot] = file;
+    const c = checkOtaFile(kind, file);
+    if (!c.ok) r.ok = false;
+    r.checks.push(c);
+  }
+  return r;
+}
+
+async function refreshOtaHint() {
+  const r = await classifyOtaFiles([...$('#ota-file').files]);
+  const hint = $('#ota-file-hint');
+  hint.textContent = r.checks.map(c => c.text).join('\n');
   hint.classList.toggle('warn', !r.ok);
   return r;
 }
-const refreshOtaHints = () => { refreshOtaHint('firmware'); refreshOtaHint('filesystem'); };
 
 function renderOtaSteps(keys) {
   $('#ota-steps').replaceChildren(...keys.map(k => { const li = h('li', '', OTA_STEPS[k]); li.dataset.step = k; return li; }));
@@ -1171,7 +1187,7 @@ function setOtaProgress(fraction) {
 // (the device refuses both with 409 as well, this just avoids the dead click).
 function lockOta(locked) {
   otaBusy = locked;
-  ['#btn-ota-start', '#ota-fw-file', '#ota-fs-file', '#btn-ota-restore', '#btn-backup-restore',
+  ['#btn-ota-start', '#ota-file', '#btn-ota-restore', '#btn-backup-restore',
     '#btn-reboot', '#btn-factory-reset']
     .forEach(s => { $(s).disabled = locked; });
 }
@@ -1251,12 +1267,12 @@ async function waitForDevice() {
 }
 
 async function startOta() {
-  const fw = $('#ota-fw-file').files[0], fs = $('#ota-fs-file').files[0];
   const msg = $('#ota-msg');
   msg.classList.remove('warn');
-  if (!fw && !fs) { msg.textContent = 'Please choose a firmware and/or filesystem image file.'; return; }
-  const checks = [fw && await refreshOtaHint('firmware'), fs && await refreshOtaHint('filesystem')].filter(Boolean);
-  if (checks.some(c => !c.ok)) {
+  if (!$('#ota-file').files.length) { msg.textContent = 'Please choose a firmware and/or filesystem image file.'; return; }
+  // Re-classified on start: the device's limits may have arrived since the selection.
+  const { fw, fs, ok, checks } = await refreshOtaHint();
+  if (!ok) {
     msg.textContent = 'Update not started: ' + checks.filter(c => !c.ok).map(c => c.text).join(' ');
     msg.classList.add('warn');
     return;
@@ -1367,8 +1383,7 @@ $('#ota-restore-input').addEventListener('change', e => {
   restoreBackupFile(e.target.files[0], otaRestoreSec);
   e.target.value = '';
 });
-$('#ota-fw-file').addEventListener('change', () => refreshOtaHint('firmware'));
-$('#ota-fs-file').addEventListener('change', () => refreshOtaHint('filesystem'));
+$('#ota-file').addEventListener('change', refreshOtaHint);
 $('#btn-ota-start').addEventListener('click', startOta);
 // Leaving mid-run would drop the upload and the automatic config restore.
 window.addEventListener('beforeunload', e => { if (otaBusy) e.preventDefault(); });

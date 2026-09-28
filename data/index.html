@@ -237,13 +237,13 @@
     <div class="card" id="ota-card">
       <h2>Upload Update <span id="ota-indicator" class="save-indicator"></span></h2>
       <p class="muted warn">The device is unreachable during the update and the following restart (about 1 minute). Keep this page open.</p>
-      <div class="row"><span>Firmware (firmware.bin)</span><input type="file" id="ota-fw-file" accept=".bin"></div>
-      <div id="ota-fw-hint" class="muted"></div>
-      <div class="row"><span>Filesystem image (littlefs.bin, optional)</span><input type="file" id="ota-fs-file" accept=".bin,.fs"></div>
-      <div id="ota-fs-hint" class="muted"></div>
-      <p class="muted">Firmware only: settings are preserved, but the web UI stays at its old version.
-        Filesystem image: replaces the web UI (index.html, app.js, style.css) and erases the saved settings -
-        they are restored automatically from the backup after the restart. Both together = complete release update.</p>
+      <div class="row"><span>Update files (firmware.bin and/or littlefs.bin)</span><input type="file" id="ota-file" accept=".bin,.fs" multiple></div>
+      <div id="ota-file-hint" class="muted ota-file-hint"></div>
+      <p class="muted">Select one or both files in the same file dialog; each file is recognized by its content, not by its name.
+        Firmware only: settings are preserved, but the web UI stays at its old version.
+        Filesystem image only: replaces the web UI (index.html, app.js, style.css) and erases the saved settings -
+        they are restored automatically from the backup after the restart. Both together = complete release update
+        (firmware first, then the image, one restart at the end).</p>
       <ol id="ota-steps" class="ota-steps"></ol>
       <progress id="ota-progress" class="ota-progress" max="1" value="0" hidden></progress>
       <div id="ota-msg" class="muted"></div>

@@ -31,4 +31,9 @@
 // uploaded to the sensor itself over UART at boot. CONFIG_SCHEMA_VERSION
 // bumped to 9 for the new region_filter block (old backups still load: it
 // defaults to off, all slots unused).
-#define FIRMWARE_VERSION "0.4.3"
+//
+// 0.4.4: The Upload Update dialog now accepts the firmware and filesystem
+// files together in a single file picker, classifying each by content
+// instead of by filename. No config changes (CONFIG_SCHEMA_VERSION stays
+// the same).
+#define FIRMWARE_VERSION "0.4.4"

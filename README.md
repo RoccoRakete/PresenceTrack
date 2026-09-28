@@ -50,6 +50,7 @@ from a local build or from a release (see below).
    (optionally verify them against `presencetrack-<x.y.z>-checksums.txt`:
    `sha256sum -c presencetrack-<x.y.z>-checksums.txt`).
 2. Web interface -> tab "Firmware" -> "Upload Update": select both files
+   together in the file dialog (they are told apart by their content)
    and click "Start update".
 3. The filesystem image replaces the whole LittleFS partition and thereby
    erases the settings (`/config.json`). The page therefore downloads a
