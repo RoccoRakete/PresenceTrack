@@ -23,4 +23,7 @@
 // 0.4.1: The Network/static-IP card moved from the MQTT tab to the System tab
 // in the web UI. Remaining German UI text has been translated to English. No
 // functional or config changes (CONFIG_SCHEMA_VERSION stays the same).
-#define FIRMWARE_VERSION "0.4.1"
+//
+// 0.4.2: The BH1750 light sensor is now read over I2C instead of only being
+// simulated. No config changes (CONFIG_SCHEMA_VERSION stays the same).
+#define FIRMWARE_VERSION "0.4.2"
