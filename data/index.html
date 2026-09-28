@@ -71,7 +71,7 @@
     <p class="muted warn" id="ld-rx-pin-warn" hidden></p>
     <label class="row"><span>TX pin</span><select id="ld-tx-pin" class="pin-select"></select></label>
     <p class="muted warn" id="ld-tx-pin-warn" hidden></p>
-    <p class="muted">Presence stays active for the occupancy timeout after the last target was lost. A target counts as moving while its speed is at least the moving threshold (0 = always moving). No hardware driver yet: with simulation disabled the radar delivers no data. Pins take effect after a restart.</p>
+    <p class="muted">Presence stays active for the occupancy timeout after the last target was lost. A target counts as moving while its speed is at least the moving threshold (0 = always moving). With simulation disabled the targets come from the radar via UART (256000 baud). The default pins RX 13 / TX 15 (D7/D8) use the hardware UART, so the USB serial log ends after boot; other pins use a software UART. Pins take effect after a restart.</p>
   </div>
 </section>
 

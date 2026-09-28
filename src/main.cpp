@@ -157,12 +157,14 @@ void setup()
     if (applyStaticIp && staticIpFails) rtcWriteStaticIpFails(staticIpHash, 0);
 
     wifiPowerApplyConfig(g_appConfig.wifi);
-    sensorsBegin(g_appConfig);
     mqttHaBegin(g_appConfig);
     webServerBegin(g_appConfig);
 
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
+    // Last: with the LD2450 on D7/D8 this swaps UART0 away from USB, so all
+    // boot output has to be written before.
+    sensorsBegin(g_appConfig);
 }
 
 void loop()

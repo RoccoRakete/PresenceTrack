@@ -674,6 +674,10 @@ static void registerLd2450Routes() {
             next.movingThresholdCmS = o["moving_threshold_cm_s"] | next.movingThresholdCmS;
             next.rxPin = o["rx_pin"] | next.rxPin;
             next.txPin = o["tx_pin"] | next.txPin;
+            if (const char *pinErr = ld2450PinError(next.rxPin, next.txPin)) {
+                sendJsonError(request, 400, pinErr);
+                return;
+            }
             if (!checkPinConflicts(next, s_cfg->bh1750, err)) {
                 sendJsonError(request, 400, err);
                 return;

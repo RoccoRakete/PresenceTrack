@@ -94,8 +94,16 @@ function h(tag, cls, content) {
 }
 
 // ---------- Pins (radar + light) ----------
+// GPIOs the firmware rejects for the LD2450 UART: GPIO1/3 are the USB serial console,
+// GPIO16 cannot receive (no pin-change interrupt).
+const PIN_UNUSABLE = { 'ld-rx-pin': [1, 3, 16], 'ld-tx-pin': [1, 3] };
 function buildPinSelects() {
-  $$('select.pin-select').forEach(sel => BOARD_PINS.forEach(([gpio, label]) => sel.add(new Option(`${label} (GPIO${gpio})`, gpio))));
+  $$('select.pin-select').forEach(sel => BOARD_PINS.forEach(([gpio, label]) => {
+    const unusable = (PIN_UNUSABLE[sel.id] || []).includes(gpio);
+    const opt = new Option(`${label} (GPIO${gpio})${unusable ? ' – not usable' : ''}`, gpio);
+    opt.disabled = unusable;
+    sel.add(opt);
+  }));
 }
 // pin_warnings of a section response -> hint below the matching select (#<prefix>-<field>-warn).
 function renderPinWarnings(pins, warnings) {

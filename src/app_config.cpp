@@ -1,4 +1,5 @@
 #include "app_config.h"
+#include "sensor_data.h"
 #include <LittleFS.h>
 
 static const char *CONFIG_PATH = "/config.json";
@@ -279,6 +280,11 @@ bool loadConfig(AppConfig &cfg) {
     return true;
 }
 
+// Serial only while it still reaches USB (not once UART0 is swapped onto the LD2450).
+static void logSaveError(const char *reason) {
+    if (serialLogEnabled()) Serial.printf("Config save failed: %s\n", reason);
+}
+
 bool saveConfig(const AppConfig &cfg) {
     JsonDocument doc;
     cfg.toJson(doc);
@@ -287,7 +293,7 @@ bool saveConfig(const AppConfig &cfg) {
     // write succeeded, so a full filesystem never leaves a truncated config.
     File f = LittleFS.open(CONFIG_TMP_PATH, "w");
     if (!f) {
-        Serial.println("Config save failed: cannot open temp file");
+        logSaveError("cannot open temp file");
         return false;
     }
 
@@ -297,14 +303,14 @@ bool saveConfig(const AppConfig &cfg) {
     f.close();
 
     if (!ok) {
-        Serial.println("Config save failed: incomplete write");
+        logSaveError("incomplete write");
         LittleFS.remove(CONFIG_TMP_PATH);
         return false;
     }
 
     // lfs_rename replaces an existing destination atomically.
     if (!LittleFS.rename(CONFIG_TMP_PATH, CONFIG_PATH)) {
-        Serial.println("Config save failed: cannot replace config file");
+        logSaveError("cannot replace config file");
         LittleFS.remove(CONFIG_TMP_PATH);
         return false;
     }

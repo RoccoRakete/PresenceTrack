@@ -1,7 +1,26 @@
 #include "sensor_data.h"
 #include "event_log.h"
+#include <SoftwareSerial.h>
 
 SensorState g_sensorState;
+
+// LD2450 UART: fixed 256000 baud 8N1, a report frame roughly every 100 ms.
+static const uint32_t LD2450_BAUD = 256000;
+static const size_t LD2450_RX_BUFFER = 256;           // ~8 frames of slack for a busy loop()
+static const unsigned long LD2450_STALE_MS = 1000;    // no valid frame for this long -> targets cleared
+// Normal report frame: header, 3 x 8 target bytes, footer (30 bytes in total).
+static const uint8_t LD2450_HEADER[] = {0xAA, 0xFF, 0x03, 0x00};
+static const uint8_t LD2450_FOOTER[] = {0x55, 0xCC};
+static const uint8_t LD2450_TARGET_BYTES = 8;
+static const uint8_t LD2450_BODY_BYTES = LD2450_MAX_TARGETS * LD2450_TARGET_BYTES;
+
+enum class Ld2450RxState : uint8_t { WaitHeader, ReadBody, WaitFooter };
+
+static Stream *s_ld2450Uart = nullptr; // Serial (swapped) or a SoftwareSerial, nullptr until sensorsBegin() / on invalid pins
+static Ld2450RxState s_ld2450RxState = Ld2450RxState::WaitHeader;
+static uint8_t s_ld2450RxPos = 0; // matched header/footer bytes or collected body bytes
+static uint8_t s_ld2450Body[LD2450_BODY_BYTES];
+static unsigned long s_ld2450LastFrameMs = 0;
 
 // Simulation tick, independent of the 2 s web UI poll so that targets move smoothly.
 static const unsigned long LD2450_TICK_MS = 300;
@@ -15,7 +34,7 @@ static const unsigned long SIM_PAUSE_MIN_MS = 3000; // pause before a lost targe
 static const unsigned long SIM_PAUSE_MAX_MS = 15000;
 // Simulated signal quality (resolution field), falling linearly with distance.
 // The scale of the real sensor field is not verified yet and has to be
-// recalibrated once the real driver exists.
+// recalibrated against real sensor frames.
 static const float SIM_RES_NEAR = 30000.0f;         // at the sensor
 static const float SIM_RES_FAR = 2000.0f;           // at maxRangeMm and beyond
 static const float SIM_RES_NOISE = 1500.0f;         // per-tick jitter
@@ -57,15 +76,53 @@ static unsigned long randomPauseMs() {
     return (unsigned long)random(SIM_PAUSE_MIN_MS, SIM_PAUSE_MAX_MS + 1);
 }
 
+const char *ld2450PinError(uint8_t rxPin, uint8_t txPin) {
+    if (rxPin == 13 && txPin == 15) return nullptr;
+    if (rxPin == 1 || rxPin == 3 || txPin == 1 || txPin == 3) {
+        return "GPIO1/GPIO3 (TX/RX) belong to the USB serial console - use D7/D8 (RX 13, TX 15) for the hardware UART";
+    }
+    if (rxPin == 16) return "GPIO16 (D0) has no pin-change interrupt and cannot receive UART data";
+    return nullptr;
+}
+
+bool serialLogEnabled() {
+    return s_ld2450Uart != &Serial;
+}
+
+// Opens the LD2450 UART on cfg.ld2450.rxPin / txPin. The pins are only read
+// here at boot (the web UI asks for a restart after a pin change).
+static void ld2450UartBegin(const AppConfig &cfg) {
+    const uint8_t rx = cfg.ld2450.rxPin;
+    const uint8_t tx = cfg.ld2450.txPin;
+    if (rx == 13 && tx == 15) {
+        // Default D7/D8: hardware UART0 swapped onto GPIO13/15 (FIFO, reliable at
+        // 256000 baud). From here on every Serial.print() goes to the sensor's RX
+        // instead of USB - the boot log ends with this line. Plain text cannot
+        // form a sensor command (those start with FD FC FB FA).
+        Serial.println("LD2450 on UART0 (D7/D8) - USB serial log ends here");
+        Serial.flush();
+        Serial.setRxBufferSize(LD2450_RX_BUFFER);
+        Serial.begin(LD2450_BAUD);
+        Serial.swap();
+        s_ld2450Uart = &Serial;
+    } else if (const char *err = ld2450PinError(rx, tx)) {
+        // Normally rejected by the web UI; guards against an old or hand-edited
+        // config. The LD2450 stays without data instead of a pin collision.
+        Serial.printf("LD2450 disabled: %s\n", err);
+    } else {
+        // Only allocated when needed.
+        SoftwareSerial *sw = new SoftwareSerial();
+        sw->begin(LD2450_BAUD, SWSERIAL_8N1, rx, tx, false, LD2450_RX_BUFFER);
+        s_ld2450Uart = sw;
+        Serial.printf("LD2450 on SoftwareSerial RX=%u TX=%u%s\n", rx, tx,
+                      *sw ? "" : " - invalid pins, no data");
+    }
+}
+
 void sensorsBegin(const AppConfig &cfg) {
-    (void)cfg;
-    // TODO: once the hardware is connected, initialize the UART here (LD2450,
-    // 256000 baud) on cfg.ld2450.rxPin / cfg.ld2450.txPin - the hardware UART
-    // only for the default 13/15 (Serial.swap() to D7/D8), otherwise a software
-    // UART - and I2C (BH1750) via Wire.begin(cfg.bh1750.sdaPin,
-    // cfg.bh1750.sclPin), then set g_sensorState.ld2450SimMode / bh1750SimMode
-    // to false. The pins are only read at boot (the web UI asks for a restart
-    // after a pin change).
+    ld2450UartBegin(cfg);
+    // TODO: once the hardware is connected, initialize I2C (BH1750) via
+    // Wire.begin(cfg.bh1750.sdaPin, cfg.bh1750.sclPin).
     randomSeed(micros());
 
     unsigned long now = millis();
@@ -136,7 +193,7 @@ static void moveTarget(SimTarget &t, float maxRange, float dtS) {
 
 // Stateful simulation of up to three moving targets, so that the zone map in
 // the web UI and the Home Assistant entities can be tested without hardware.
-// A real LD2450 driver replaces only this function (fill state.targets[]).
+// The real driver (pollLd2450Uart) fills the same state.targets[].
 static void simulateLd2450Targets(const AppConfig &cfg, unsigned long now, float dtS) {
     Ld2450State &s = g_sensorState.ld2450;
     const float maxRange = (float)cfg.ld2450.maxRangeMm;
@@ -170,6 +227,97 @@ static void simulateLd2450Targets(const AppConfig &cfg, unsigned long now, float
         float res = SIM_RES_NEAR - (SIM_RES_NEAR - SIM_RES_FAR) * rangeFrac +
                     randomFloat(-SIM_RES_NOISE, SIM_RES_NOISE);
         out.resolution = (uint16_t)lroundf(constrain(res, 0.0f, 65535.0f));
+    }
+}
+
+// x / y / speed are sign-magnitude, not two's complement: bit 15 set means
+// positive, clear means negative, the lower 15 bits are the magnitude.
+static int16_t decodeLd2450Signed(const uint8_t *p) {
+    uint16_t raw = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    int16_t magnitude = (int16_t)(raw & 0x7FFF);
+    return (raw & 0x8000) ? magnitude : (int16_t)-magnitude;
+}
+
+// Copies a complete frame body into state.targets[]. An empty slot is sent as
+// all zeros; `moving` is left to classifyTargetMotion().
+static void applyLd2450Frame(unsigned long now) {
+    Ld2450State &s = g_sensorState.ld2450;
+    for (uint8_t i = 0; i < LD2450_MAX_TARGETS; i++) {
+        const uint8_t *p = s_ld2450Body + i * LD2450_TARGET_BYTES;
+        Ld2450Target &out = s.targets[i];
+        int16_t x = decodeLd2450Signed(p);
+        int16_t y = decodeLd2450Signed(p + 2);
+        if (x == 0 && y == 0) {
+            out = Ld2450Target{};
+            continue;
+        }
+        out.active = true;
+        out.xMm = x;
+        out.yMm = y;
+        out.speedCmS = decodeLd2450Signed(p + 4);
+        out.resolution = (uint16_t)p[6] | ((uint16_t)p[7] << 8);
+    }
+    s_ld2450LastFrameMs = now;
+    g_sensorState.ld2450LastUpdateMs = now;
+}
+
+// Header matching; a mismatching byte is checked again as a possible header
+// start, so a frame directly after garbage is not lost.
+static void matchLd2450Header(uint8_t b) {
+    if (b == LD2450_HEADER[s_ld2450RxPos]) {
+        s_ld2450RxPos++;
+    } else {
+        s_ld2450RxPos = b == LD2450_HEADER[0] ? 1 : 0;
+    }
+    if (s_ld2450RxPos == sizeof(LD2450_HEADER)) {
+        s_ld2450RxState = Ld2450RxState::ReadBody;
+        s_ld2450RxPos = 0;
+    }
+}
+
+// Non-blocking frame parser, fed with every waiting byte on each loop() so the
+// UART buffer cannot overflow. Frames are only applied without simulation;
+// with simulation on, the bytes are still drained so no stale backlog remains.
+static void pollLd2450Uart(bool apply, unsigned long now) {
+    if (!s_ld2450Uart) return;
+    while (s_ld2450Uart->available() > 0) {
+        uint8_t b = (uint8_t)s_ld2450Uart->read();
+        switch (s_ld2450RxState) {
+            case Ld2450RxState::WaitHeader:
+                matchLd2450Header(b);
+                break;
+            case Ld2450RxState::ReadBody:
+                s_ld2450Body[s_ld2450RxPos++] = b;
+                if (s_ld2450RxPos == LD2450_BODY_BYTES) {
+                    s_ld2450RxState = Ld2450RxState::WaitFooter;
+                    s_ld2450RxPos = 0;
+                }
+                break;
+            case Ld2450RxState::WaitFooter:
+                if (b != LD2450_FOOTER[s_ld2450RxPos]) {
+                    s_ld2450RxState = Ld2450RxState::WaitHeader;
+                    s_ld2450RxPos = 0;
+                    matchLd2450Header(b);
+                    break;
+                }
+                if (++s_ld2450RxPos == sizeof(LD2450_FOOTER)) {
+                    if (apply) applyLd2450Frame(now);
+                    s_ld2450RxState = Ld2450RxState::WaitHeader;
+                    s_ld2450RxPos = 0;
+                }
+                break;
+        }
+    }
+}
+
+// Sensor unplugged or silent: drop the last targets instead of freezing them,
+// the occupancy timeout then clears presence as usual.
+static void expireLd2450Targets(unsigned long now) {
+    if (now - s_ld2450LastFrameMs < LD2450_STALE_MS) return;
+    for (uint8_t i = 0; i < LD2450_MAX_TARGETS; i++) {
+        if (g_sensorState.ld2450.targets[i].active) {
+            g_sensorState.ld2450.targets[i] = Ld2450Target{};
+        }
     }
 }
 
@@ -285,8 +433,8 @@ static void clearLd2450State() {
     for (uint8_t t = 0; t < LD2450_MAX_TARGETS; t++) s_targetMovingSeen[t] = false;
 }
 
-// Applies a changed sim_enabled setting. Without a real driver, "simulation
-// off" means no data source at all, so the stale values are cleared.
+// Applies a changed sim_enabled setting. The values of the previous data
+// source (simulation or UART) are cleared.
 static void syncSimMode(const AppConfig &cfg, unsigned long now) {
     if (cfg.ld2450.simEnabled != g_sensorState.ld2450SimMode) {
         g_sensorState.ld2450SimMode = cfg.ld2450.simEnabled;
@@ -310,6 +458,8 @@ void sensorsLoop(const AppConfig &cfg) {
 
     if (cfg.ld2450.enabled) {
         s_ld2450Cleared = false;
+        // Every loop(), not only on the tick, so the UART buffer cannot overflow
+        pollLd2450Uart(!cfg.ld2450.simEnabled, now);
         if (now - s_lastLd2450Update >= LD2450_TICK_MS) {
             float dtS = (float)(now - s_lastLd2450Update) / 1000.0f;
             if (dtS > SIM_MAX_DT_S) dtS = SIM_MAX_DT_S;
@@ -317,8 +467,9 @@ void sensorsLoop(const AppConfig &cfg) {
             if (cfg.ld2450.simEnabled) {
                 simulateLd2450Targets(cfg, now, dtS);
                 g_sensorState.ld2450LastUpdateMs = now;
+            } else {
+                expireLd2450Targets(now);
             }
-            // TODO: poll the real LD2450 driver (parse UART frames into state.targets[])
             evaluateLd2450Presence(cfg, now);
         }
     } else if (!s_ld2450Cleared) {

@@ -59,9 +59,9 @@ struct Ld2450Config {
     bool multiTarget = true;        // native sensor mode preference (for later real UART command)
     uint16_t maxRangeMm = 6000;      // map scale / plausibility bound for simulated X/Y
     uint16_t occupancyTimeoutS = 5;  // hold-off before presence goes false after last target loss (firmware-side, no sensor equivalent)
-    bool simEnabled = true;          // simulated targets as long as no real driver delivers data
+    bool simEnabled = true;          // simulated targets instead of the UART frames
     uint16_t movingThresholdCmS = 10; // |speed| >= threshold -> target counts as moving (0..1000)
-    // GPIO numbers; stored and validated only, no UART driver uses them yet
+    // GPIO numbers, read at boot: 13/15 = hardware UART0 swapped to D7/D8, else SoftwareSerial
     uint8_t rxPin = 13; // D7
     uint8_t txPin = 15; // D8
 };
