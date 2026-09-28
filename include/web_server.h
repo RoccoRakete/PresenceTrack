@@ -11,5 +11,5 @@
 void webServerBegin(AppConfig &cfg);
 
 // Must be called regularly from loop() (delayed restart after /api/reboot or
-// /api/factory-reset; gibt Plätze des HTTP-Verbindungslimits wieder frei).
+// /api/factory-reset; releases slots of the HTTP connection limit).
 void webServerLoop();

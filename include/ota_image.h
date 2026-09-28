@@ -3,10 +3,10 @@
 #include <Arduino.h>
 #include <flash_hal.h>
 
-// Bildprüfungen und Größengrenzen für OTA-Images des Datei-Uploads
-// (web_server.cpp, /api/firmware + /api/filesystem, auch von der Recovery-Seite
-// und per curl). Alles, was ein Image ablehnen kann, läuft vor Update.begin(),
-// also vor dem ersten Löschen im Flash.
+// Image checks and size limits for OTA images from the file upload
+// (web_server.cpp, /api/firmware + /api/filesystem, also used by the recovery
+// page and curl). Everything that can reject an image runs before
+// Update.begin(), i.e. before the first flash erase.
 
 // Flash layout values, kept in one place. FS_PHYS_SIZE / FS_PHYS_BLOCK (the
 // LittleFS partition) come from the core (flash_hal.h, via the linker symbols
@@ -65,7 +65,7 @@ bool otaHasFirmwareMagic(const uint8_t *data, size_t len);
 // would therefore destroy the web UI and config with no way back. Validating
 // the superblock in the first chunk catches that before the first erase.
 //
-// Liefert bei Erfolg die Image-Größe laut Superblock (= FS_PHYS_SIZE), sonst
-// false und eine Meldung in error (immer nullterminiert, wird abgeschnitten,
-// wenn errorLen nicht reicht; 128 B reichen für jede Meldung).
+// On success returns the image size according to the superblock (= FS_PHYS_SIZE),
+// otherwise false and a message in error (always null-terminated, truncated
+// if errorLen is too small; 128 B are enough for every message).
 bool otaCheckLittleFsImage(const uint8_t *data, size_t len, uint32_t &imageSize, char *error, size_t errorLen);

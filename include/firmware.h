@@ -9,14 +9,14 @@
 // config layout only changes with some releases, and a firmware that keeps the
 // layout must not look like a schema change in /config.json backups.
 //
-// Muss exakt zum GitHub-Release-Tag v<FIRMWARE_VERSION> passen: die CI
-// (.github/workflows/firmware.yml) prüft das bei jedem Tag-Build und
-// veröffentlicht bei Abweichung kein Release - sonst trügen die Release-Assets
-// eine andere Fassung im Namen, als das Gerät nach dem Upload unter /api/system
-// meldet.
+// Must match the GitHub release tag v<FIRMWARE_VERSION> exactly: the CI
+// (.github/workflows/firmware.yml) checks this on every tag build and
+// publishes no release on a mismatch - otherwise the release assets would
+// carry a different version in their names than the device reports under
+// /api/system after the upload.
 //
-// 0.4.0: Das Update direkt vom Gerät aus GitHub ist entfernt. Updates laufen nur
-// noch über den Datei-Upload der Weboberfläche (/api/firmware, /api/filesystem)
-// oder per USB (flash.sh). Das Konfigurationsformat ist unverändert
-// (CONFIG_SCHEMA_VERSION bleibt).
+// 0.4.0: Updating directly from GitHub on the device has been removed. Updates
+// now only run through the web interface's file upload (/api/firmware,
+// /api/filesystem) or via USB (flash.sh). The config format is unchanged
+// (CONFIG_SCHEMA_VERSION stays the same).
 #define FIRMWARE_VERSION "0.4.0"

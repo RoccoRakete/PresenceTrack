@@ -25,30 +25,29 @@ static const unsigned long REBOOT_DELAY_MS = 300;
 
 static const uint16_t HTTP_PORT = 80;
 
-// Obergrenze gleichzeitiger HTTP-Verbindungen. Weitere SYNs verwirft lwIP
-// stillschweigend, und der Client wiederholt sie nach ~1 s (TCP-Retransmit) -
-// überzählige Verbindungen warten also, statt fehlzuschlagen. Ohne Limit reicht
-// der Heap nicht für beliebig viele parallele Requests (jede Verbindung kostet
-// pcb, AsyncClient, Request-Objekt, Request-Header und Sendepuffer), und der
-// erste gescheiterte `new` in einer Library ist ein Neustart. Chrome öffnet bis
-// zu 6 Verbindungen, die UI lädt aber nacheinander, 4 reicht für einen
-// Seitenaufruf ohne Wartezeit. Ein OTA-Upload belegt einen Platz, solange er
-// läuft (die UI pausiert währenddessen ihr Polling).
+// Upper bound of concurrent HTTP connections. lwIP silently drops further
+// SYNs and the client retries them after ~1 s (TCP retransmit) - excess
+// connections therefore wait instead of failing. Without a limit the heap
+// does not suffice for arbitrarily many parallel requests (each connection
+// costs a pcb, AsyncClient, request object, request headers and send buffer),
+// and the first failed `new` inside a library is a reboot. Chrome opens up to
+// 6 connections, but the UI loads sequentially, so 4 is enough for a page load
+// without waiting. An OTA upload occupies one slot while it runs (the UI
+// pauses its polling meanwhile).
 static const uint8_t MAX_HTTP_CONNECTIONS = 4;
 
 static tcp_pcb_listen *s_httpListener = nullptr;
 
-// Setzt das Listen-Backlog so, dass lwIP nur noch so viele Handshakes annimmt,
-// wie Plätze frei sind (Handshakes im SYN_RCVD zählt lwIP selbst gegen das
-// Backlog, bei 0 werden alle SYNs verworfen).
+// Sets the listen backlog so that lwIP only accepts as many handshakes as
+// there are free slots (lwIP itself counts handshakes in SYN_RCVD against the
+// backlog; at 0 all SYNs are dropped).
 //
-// Gezählt werden nur Verbindungen, die noch einen AsyncClient haben (tcp_arg
-// gesetzt; ESPAsyncTCP löscht es beim Schließen). Die pcbs selbst leben nach
-// dem Schließen weiter, im FIN_WAIT_2 bis zu 20 s, wenn die Gegenseite ihr FIN
-// schuldig bleibt - z.B. Chromes ungenutzte Vorab-Verbindungen, die der Server
-// nach 3 s Leerlauf schließt. Gemessen: vier solche Verbindungen blockierten
-// den Server mit lwIPs eigener Zählung (tcp_backlog_delayed) 20 s lang, obwohl
-// sie kaum noch Heap belegen.
+// Only connections that still have an AsyncClient are counted (tcp_arg set;
+// ESPAsyncTCP clears it on close). The pcbs themselves live on after closing,
+// in FIN_WAIT_2 for up to 20 s if the peer never sends its FIN - e.g. Chrome's
+// unused preconnects, which the server closes after 3 s of idle time.
+// Measured: four such connections blocked the server for 20 s with lwIP's own
+// counting (tcp_backlog_delayed), even though they hardly use any heap anymore.
 static void updateConnectionLimit() {
     if (!s_httpListener) return;
     uint8_t open = 0;
@@ -58,13 +57,13 @@ static void updateConnectionLimit() {
     s_httpListener->backlog = open >= MAX_HTTP_CONNECTIONS ? 0 : MAX_HTTP_CONNECTIONS - open;
 }
 
-// AsyncWebServer, der bei jeder neuen Verbindung das Limit nachführt; beim
-// Schließen tut das webServerLoop().
+// AsyncWebServer that updates the limit on every new connection; on close
+// webServerLoop() does that.
 class LimitedWebServer : public AsyncWebServer {
   public:
     explicit LimitedWebServer(uint16_t port) : AsyncWebServer(port) {
-        // Ersetzt den onClient-Handler von AsyncWebServer: gleicher Rumpf, plus
-        // Limit und nothrow (ein normales `new` würde bei OOM paniken)
+        // Replaces AsyncWebServer's onClient handler: same body, plus the
+        // limit and nothrow (a plain `new` would panic on OOM)
         _server.onClient([](void *s, AsyncClient *c) {
             if (c == NULL) return;
             updateConnectionLimit();
@@ -91,21 +90,21 @@ using JsonPostHandler = std::function<void(JsonDocument &, JsonDocument &, Async
 // ---------------------------------------------------------------------------
 // Response helpers
 //
-// Warum eigene Response-Klassen statt request->send(code, type, String): der
-// freie Heap muss für alle gleichzeitig offenen Verbindungen reichen, und ein
-// Engpass endet nicht mit einem Fehler, sondern mit einem Neustart - die
-// Libraries allokieren mit `new`, und das panict auf dem ESP8266 bei OOM
-// ("Unhandled C++ exception: OOM", im lwIP-Kontext, also nicht abfangbar).
-// AsyncBasicResponse hält den Body pro Request dreimal (Kopie im Response-Objekt,
-// Kopie mit vorangestelltem Header, Kopie im lwIP-Sendepuffer) plus eine Liste
-// von Header-Objekten; beginResponseStream() kostet zusätzlich einen 1460-Byte-
-// cbuf. Die Klassen hier schreiben Header und Body direkt in den TCP-Sendepuffer
-// (lwIP kopiert ohnehin) und behalten nur, was dort noch nicht hineinpasste.
+// Why custom response classes instead of request->send(code, type, String): the
+// free heap has to suffice for all simultaneously open connections, and a
+// shortage does not end in an error but in a reboot - the libraries allocate
+// with `new`, and that panics on the ESP8266 on OOM ("Unhandled C++ exception:
+// OOM", in lwIP context, so it cannot be caught).
+// AsyncBasicResponse holds the body three times per request (copy in the
+// response object, copy with the header prepended, copy in the lwIP send
+// buffer) plus a list of header objects; beginResponseStream() additionally
+// costs a 1460-byte cbuf. The classes here write header and body directly into
+// the TCP send buffer (lwIP copies anyway) and only keep what did not fit yet.
 // ---------------------------------------------------------------------------
 
-// Sendet Statuszeile/Header und dann den Body in Stücken, die nextPiece()
-// liefert. Ist der Sendepuffer voll oder bekommt lwIP gerade keine pbufs, geht
-// es beim nächsten ACK bzw. Poll (alle 500 ms) weiter.
+// Sends the status line/headers and then the body in pieces returned by
+// nextPiece(). If the send buffer is full or lwIP gets no pbufs right now, it
+// continues on the next ACK or poll (every 500 ms).
 class PiecewiseResponse : public AsyncWebServerResponse {
   public:
     explicit PiecewiseResponse(int code) { _code = code; }
@@ -130,15 +129,15 @@ class PiecewiseResponse : public AsyncWebServerResponse {
     }
 
   protected:
-    // Content-Length; wird einmal vor dem ersten nextPiece() abgefragt.
+    // Content-Length; queried once before the first nextPiece().
     virtual size_t bodyLength() const = 0;
-    // Nächstes Stück des Bodys, false am Ende. Der Zeiger muss gültig bleiben,
-    // bis nextPiece() das nächste Mal aufgerufen wird.
+    // Next piece of the body, false at the end. The pointer must stay valid
+    // until nextPiece() is called the next time.
     virtual bool nextPiece(const char *&data, size_t &len) = 0;
 
-    // Setzt nextPiece(), wenn der Body nicht mehr so fertig werden kann, wie die
-    // Content-Length angekündigt hat: dann wird die Verbindung geschlossen, statt
-    // den Client auf Bytes warten zu lassen, die nie kommen.
+    // Set by nextPiece() when the body can no longer be completed as announced
+    // by Content-Length: the connection is then closed instead of letting the
+    // client wait for bytes that never arrive.
     bool _truncated = false;
 
   private:
@@ -148,15 +147,15 @@ class PiecewiseResponse : public AsyncWebServerResponse {
             if (_pieceLen == 0) {
                 if (!nextPiece(_piece, _pieceLen)) {
                     _state = RESPONSE_WAIT_ACK;
-                    // close(false) erst beim nächsten Poll: ein sofortiges Schließen
-                    // würde den Request samt dieser Response noch im Aufruf löschen
+                    // close(false) only takes effect on the next poll: closing right away
+                    // would delete the request along with this response mid-call
                     if (_truncated) client->close(false);
                     break;
                 }
                 continue;
             }
             size_t n = client->add(_piece, _pieceLen);
-            if (n == 0) break; // Sendepuffer voll oder kein Speicher für pbufs
+            if (n == 0) break; // send buffer full or no memory for pbufs
             _piece += n;
             _pieceLen -= n;
             _writtenLength += n;
@@ -169,8 +168,8 @@ class PiecewiseResponse : public AsyncWebServerResponse {
     size_t _pieceLen = 0;
 };
 
-// Fertig serialisiertes JSON. Der String wird freigegeben, sobald lwIP alles
-// übernommen hat - bei den meisten Antworten schon in _respond().
+// Fully serialized JSON. The string is released as soon as lwIP has taken
+// everything - for most responses already in _respond().
 class JsonBufferResponse : public PiecewiseResponse {
   public:
     JsonBufferResponse(int code, String &&body) : PiecewiseResponse(code), _body(std::move(body)) {}
@@ -194,13 +193,12 @@ class JsonBufferResponse : public PiecewiseResponse {
     bool _handedOut = false;
 };
 
-// /api/events: {"uptime_ms":..,"last_id":..,"events":[...]} mit den Events
-// (since, neueste], eines nach dem anderen direkt aus dem Ringpuffer gerendert
-// (siehe eventLogEventToJson). Die Content-Length ergibt sich aus einem
-// Probedurchlauf. Wird während der Übertragung ein noch nicht gesendetes Event
-// überschrieben (nur bei vollem Puffer und mehr neuen als bereits gesendeten
-// Events denkbar), bricht die Antwort ab; die UI behält ihre Liste und fragt
-// beim nächsten Poll erneut.
+// /api/events: {"uptime_ms":..,"last_id":..,"events":[...]} with the events
+// (since, newest], rendered one after another directly from the ring buffer
+// (see eventLogEventToJson). The Content-Length comes from a dry run. If an
+// event not yet sent is overwritten during the transfer (only conceivable with
+// a full buffer and more new events than already sent ones), the response is
+// aborted; the UI keeps its list and asks again on the next poll.
 class EventsResponse : public PiecewiseResponse {
   public:
     explicit EventsResponse(uint32_t sinceId) : PiecewiseResponse(200) {
@@ -248,8 +246,8 @@ class EventsResponse : public PiecewiseResponse {
     }
 
   private:
-    // Größtes Event: ~90 Byte Rahmen + 47 Zeichen Meldung, im schlimmsten Fall
-    // jedes als \u00XX escaped (6 Byte)
+    // Largest event: ~90 bytes of framing + 47 message characters, in the worst
+    // case each escaped as \u00XX (6 bytes)
     char _line[384];
     uint32_t _first;
     uint32_t _next;
@@ -258,9 +256,9 @@ class EventsResponse : public PiecewiseResponse {
     size_t _length;
 };
 
-// response == nullptr heißt: nicht einmal das Response-Objekt passte noch in den
-// Heap. Dann ohne Antwort schließen (der Client sieht einen Verbindungsabbruch),
-// statt mit einem normalen `new` zu paniken.
+// response == nullptr means: not even the response object fit into the heap
+// anymore. Then close without a response (the client sees a dropped
+// connection) instead of panicking with a plain `new`.
 static void sendResponse(AsyncWebServerRequest *request, AsyncWebServerResponse *response) {
     if (response) {
         request->send(response);
@@ -269,10 +267,10 @@ static void sendResponse(AsyncWebServerRequest *request, AsyncWebServerResponse 
     }
 }
 
-// Heap, der nach dem Anlegen eines Bodys frei bleiben muss: die übrigen bis zu
-// MAX_HTTP_CONNECTIONS - 1 Verbindungen allokieren noch Request-Header,
-// Response-Objekte und Sendepuffer (gemessen ~2 kB je Verbindung). Nur große
-// Antworten wie /api/config/backup (2,7 kB) stoßen im Parallelbetrieb daran.
+// Heap that has to stay free after allocating a body: the remaining up to
+// MAX_HTTP_CONNECTIONS - 1 connections still allocate request headers,
+// response objects and send buffers (measured ~2 kB per connection). Only large
+// responses like /api/config/backup (2.7 kB) hit this under parallel load.
 static const uint32_t RESPONSE_HEAP_RESERVE = 6144;
 
 static void sendJsonDoc(AsyncWebServerRequest *request, int code, const JsonDocument &doc);
@@ -281,10 +279,10 @@ static void sendJsonError(AsyncWebServerRequest *request, int code, const String
 static void sendJsonDoc(AsyncWebServerRequest *request, int code, const JsonDocument &doc) {
     size_t len = measureJson(doc);
     String body;
-    // overflowed(): dem Dokument fehlen Werte, weil der Heap schon beim Befüllen
-    // knapp war - lieber 503 als z.B. ein unvollständiges Konfigurations-Backup.
-    // reserve() exakt: beim schrittweisen Wachsen bräuchte der String kurz alten
-    // und neuen Puffer gleichzeitig.
+    // overflowed(): the document is missing values because the heap was already
+    // tight while filling it - better a 503 than e.g. an incomplete config backup.
+    // reserve() exactly: growing step by step, the string would briefly need the
+    // old and the new buffer at the same time.
     if (doc.overflowed() || ESP.getFreeHeap() < len + RESPONSE_HEAP_RESERVE || !body.reserve(len)) {
         sendResponse(request, new (std::nothrow) JsonBufferResponse(503, String(F("{\"error\":\"device busy, retry\"}"))));
         return;
@@ -1152,8 +1150,8 @@ static void registerEventRoutes() {
     });
 }
 
-// Neustart REBOOT_DELAY_MS (300 ms) später aus webServerLoop(), damit die
-// laufende HTTP-Antwort noch hinausgeht; loggt Reboot bzw. FactoryReset.
+// Restarts REBOOT_DELAY_MS (300 ms) later from webServerLoop(), so that the
+// running HTTP response still goes out; logs Reboot or FactoryReset.
 // The log entry is lost with the restart; the next boot logs its reset reason.
 static void webServerScheduleReboot(bool factoryReset) {
     eventLogPush(factoryReset ? EventType::FactoryReset : EventType::Reboot,
@@ -1522,10 +1520,10 @@ static void registerSystemRoutes() {
         doc["core_version"] = ESP.getCoreVersion();
         doc["sdk_version"] = ESP.getSdkVersion();
         doc["reset_reason"] = ESP.getResetReason();
-        // Tiefstwert des Allokators selbst (UMM_STATS_FULL, platformio.ini): wird
-        // in jedem malloc nachgeführt und erfasst so auch die Spitze mitten in
-        // parallelen Requests, die ein Abtasten aus loop() nie sieht. Zurückgesetzt
-        // am Ende von webServerBegin(), die Boot-Spitze von WiFiManager zählt nicht.
+        // Low-water mark of the allocator itself (UMM_STATS_FULL, platformio.ini):
+        // updated in every malloc, so it also captures the peak in the middle of
+        // parallel requests that sampling from loop() never sees. Reset at the end
+        // of webServerBegin(), so WiFiManager's boot peak does not count.
         doc["min_free_heap"] = umm_free_heap_size_min();
         sendJsonDoc(request, 200, doc);
     });
@@ -1631,7 +1629,7 @@ void webServerBegin(AppConfig &cfg) {
     registerStaticRoutes();
 
     server.begin();
-    // Der Listen-pcb entsteht erst in begin(); AsyncServer gibt ihn nicht heraus
+    // The listen pcb is only created in begin(); AsyncServer does not expose it
     for (tcp_pcb_listen *l = tcp_listen_pcbs.listen_pcbs; l; l = l->next) {
         if (l->local_port == HTTP_PORT) s_httpListener = l;
     }

@@ -30,18 +30,18 @@ static const uint8_t EVENT_LOG_SIZE = 64;
 // printf-style; overwrites the oldest entry once the buffer is full.
 void eventLogPush(EventType type, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
-// Neueste Id (0 solange leer) und älteste noch gepufferte Id (1 solange leer).
-// Die Ids sind lückenlos, ein Client mit ?since=<id> braucht also genau die Ids
-// (max(since, älteste - 1), neueste].
+// Newest id (0 while empty) and oldest id still buffered (1 while empty).
+// The ids have no gaps, so a client with ?since=<id> needs exactly the ids
+// (max(since, oldest - 1), newest].
 uint32_t eventLogNewestId();
 uint32_t eventLogOldestId();
 
-// Serialisiert das Event `id` als JSON-Objekt nach buf. Liefert die Länge, oder
-// 0, wenn die Id nicht (mehr) gepuffert ist oder nicht in `size` passt.
+// Serializes event `id` as a JSON object into buf. Returns the length, or
+// 0 if the id is not (or no longer) buffered or does not fit into `size`.
 //
-// Bewusst ein Event nach dem anderen statt eines JsonDocument für die ganze
-// Liste: bei vollem Puffer sind das 5-9 kB JSON plus ein etwa gleich großes
-// JsonDocument, was allein schon den freien Heap sprengt - /api/events?since=0
-// hat das Gerät so zum Absturz gebracht. web_server.cpp streamt die Events
-// deshalb einzeln.
+// Deliberately one event at a time instead of a JsonDocument for the whole
+// list: with a full buffer that is 5-9 kB of JSON plus a JsonDocument of about
+// the same size, which alone exceeds the free heap - /api/events?since=0
+// crashed the device that way. web_server.cpp therefore streams the events
+// one by one.
 size_t eventLogEventToJson(uint32_t id, char *buf, size_t size);

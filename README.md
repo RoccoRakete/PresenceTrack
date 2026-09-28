@@ -1,65 +1,65 @@
 # PresenceTrack
 
-ESP8266-Firmware fuer einen Anwesenheits- und Helligkeitssensor: LD2410C
-(mmWave-Praesenzradar) + BH1750FVI (Helligkeit), angebunden an Home Assistant
-per MQTT-Discovery. Konfiguration, Status und Firmware-Updates laufen ueber
-eine Web-Oberflaeche, die das Geraet selbst ausliefert.
+ESP8266 firmware for a presence and illuminance sensor: LD2410C
+(mmWave presence radar) + BH1750FVI (illuminance), connected to Home Assistant
+via MQTT discovery. Configuration, status and firmware updates run through
+a web interface served by the device itself.
 
 ## Hardware
 
-- ESP8266 D1 Mini (4 MB Flash, Board-Layout `d1_mini`)
-- LD2410C (UART, Praesenz-/Bewegungserkennung)
-- BH1750FVI (I2C, Helligkeit)
+- ESP8266 D1 Mini (4 MB flash, board layout `d1_mini`)
+- LD2410C (UART, presence/motion detection)
+- BH1750FVI (I2C, illuminance)
 
-## Verzeichnisstruktur
+## Directory layout
 
 ```
-include/        Header der Firmware-Module
-src/            Implementierung (Sensorik, WLAN, MQTT/HA, Webserver, OTA)
-data/           Web-Oberflaeche (wird als LittleFS-Image mitgeflasht)
-platformio.ini  Board- und Build-Konfiguration
-flash.sh        Interaktives Flash-Skript (USB, mit Config-Backup/Restore)
+include/        Headers of the firmware modules
+src/            Implementation (sensors, Wi-Fi, MQTT/HA, web server, OTA)
+data/           Web interface (flashed as a LittleFS image)
+platformio.ini  Board and build configuration
+flash.sh        Interactive flash script (USB, with config backup/restore)
 .github/        CI workflow (build and release)
 ```
 
-## Lokaler Build
+## Local build
 
-PlatformIO wird per Nix bereitgestellt (`flake.nix`/`.envrc`, direnv aktiviert
-die Shell automatisch; ohne direnv manuell mit `nix shell nixpkgs#platformio`):
+PlatformIO is provided via Nix (`flake.nix`/`.envrc`; direnv activates the
+shell automatically, without direnv run `nix shell nixpkgs#platformio` manually):
 
 ```
-pio run                # Firmware  -> .pio/build/d1_mini/firmware.bin
-pio run -t buildfs     # Dateisystem -> .pio/build/d1_mini/littlefs.bin (aus data/)
+pio run                # firmware   -> .pio/build/d1_mini/firmware.bin
+pio run -t buildfs     # filesystem -> .pio/build/d1_mini/littlefs.bin (from data/)
 ```
 
-## Flashen
+## Flashing
 
-**Per USB:** `./flash.sh [seriell-port] [geraete-ip]` fragt interaktiv ab, ob
-Firmware, Dateisystem oder beides geflasht werden soll, sichert bei einem
-Dateisystem-Update vorher die laufende Konfiguration ueber die Geraete-API und
-stellt sie danach automatisch wieder her.
+**Via USB:** `./flash.sh [serial-port] [device-ip]` asks interactively whether
+to flash the firmware, the filesystem or both, backs up the running
+configuration through the device API before a filesystem update and restores
+it automatically afterwards.
 
-**Ueber die Web-Oberflaeche (OTA, kein USB-Kabel noetig):** Tab "Firmware" ->
-"Upload Update" nimmt `firmware.bin` und optional `littlefs.bin` an, aus einem
-lokalen Build oder aus einem Release (siehe unten).
+**Via the web interface (OTA, no USB cable needed):** tab "Firmware" ->
+"Upload Update" accepts `firmware.bin` and optionally `littlefs.bin`, either
+from a local build or from a release (see below).
 
-## Update auf eine neue Version
+## Updating to a new version
 
-1. Im GitHub-Release die beiden Images herunterladen:
-   `presencetrack-<x.y.z>-firmware.bin` und `presencetrack-<x.y.z>-littlefs.bin`
-   (optional gegen `presencetrack-<x.y.z>-checksums.txt` pruefen:
+1. Download both images from the GitHub release:
+   `presencetrack-<x.y.z>-firmware.bin` and `presencetrack-<x.y.z>-littlefs.bin`
+   (optionally verify them against `presencetrack-<x.y.z>-checksums.txt`:
    `sha256sum -c presencetrack-<x.y.z>-checksums.txt`).
-2. Web-Oberflaeche -> Tab "Firmware" -> "Upload Update": beide Dateien
-   auswaehlen und "Start update".
-3. Das Dateisystem-Image ersetzt die ganze LittleFS-Partition und loescht dabei
-   die Einstellungen (`/config.json`). Die Seite laedt deshalb vor dem Upload
-   ein Konfigurations-Backup in den Download-Ordner des Browsers und spielt es
-   nach dem Neustart automatisch wieder ein. Schlaegt das fehl: Karte
-   "Restore Backup" mit genau dieser Datei.
+2. Web interface -> tab "Firmware" -> "Upload Update": select both files
+   and click "Start update".
+3. The filesystem image replaces the whole LittleFS partition and thereby
+   erases the settings (`/config.json`). The page therefore downloads a
+   configuration backup into the browser's download folder before the upload
+   and restores it automatically after the reboot. If that fails: use the
+   "Restore Backup" card with exactly that file.
 
-Alternativ per USB: `./flash.sh [seriell-port] [geraete-ip]`, Auswahl 3
-(beides); mit Geraete-IP sichert und restauriert das Skript die Konfiguration
-genauso.
+Alternatively via USB: `./flash.sh [serial-port] [device-ip]`, option 3
+(both); with a device IP the script backs up and restores the configuration
+the same way.
 
 ## Release process
 
@@ -71,7 +71,7 @@ genauso.
    publishes a GitHub release with
    `presencetrack-<x.y.z>-firmware.bin`, `presencetrack-<x.y.z>-littlefs.bin`
    and `presencetrack-<x.y.z>-checksums.txt`. Installing it on the device is
-   described under "Update auf eine neue Version".
+   described under "Updating to a new version".
 
 Pushes to `main` and pull requests only build (artifacts are uploaded for
 traceability) without creating a release.

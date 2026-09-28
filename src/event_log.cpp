@@ -43,10 +43,10 @@ uint32_t eventLogOldestId() {
 
 size_t eventLogEventToJson(uint32_t id, char *buf, size_t size) {
     if (id < eventLogOldestId() || id > eventLogNewestId()) return 0;
-    // Id 1 liegt in Slot 0 und jede Id belegt den nächsten Slot
+    // Id 1 lives in slot 0 and every id occupies the next slot
     const LogEvent &e = s_events[(id - 1) % EVENT_LOG_SIZE];
-    // Nur ein kleines Dokument pro Event: Schlüssel und Typ sind Literale (werden
-    // nicht kopiert), nur die Meldung wird kopiert - gut 100 Byte Heap.
+    // Only a small document per event: keys and type are literals (not
+    // copied), only the message is copied - a little over 100 bytes of heap.
     JsonDocument doc;
     doc["id"] = e.id;
     doc["uptime_ms"] = e.uptimeMs;
