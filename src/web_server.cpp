@@ -36,6 +36,14 @@ static const uint16_t HTTP_PORT = 80;
 // pauses its polling meanwhile).
 static const uint8_t MAX_HTTP_CONNECTIONS = 4;
 
+// How long sent response data may stay unacknowledged before ESPAsyncTCP
+// closes the connection (library default ASYNC_MAX_ACK_TIME: 5 s). lwIP doubles
+// its retransmit timeout on every loss (~1 s, 2 s, 4 s ...), so on a lossy
+// Wi-Fi link three losses of the same segment already exceed 5 s and cut
+// app.js/index.html off mid-transfer. 15 s rides out one more doubling; a peer
+// that is really gone is still dropped after that.
+static const uint32_t HTTP_ACK_TIMEOUT_MS = 15000;
+
 static tcp_pcb_listen *s_httpListener = nullptr;
 
 // Sets the listen backlog so that lwIP only accepts as many handshakes as
@@ -67,7 +75,10 @@ class LimitedWebServer : public AsyncWebServer {
         _server.onClient([](void *s, AsyncClient *c) {
             if (c == NULL) return;
             updateConnectionLimit();
+            // Only covers the wait for the request: send() switches the RX timeout
+            // off before the response starts, so it never cuts a transfer short.
             c->setRxTimeout(3);
+            c->setAckTimeout(HTTP_ACK_TIMEOUT_MS);
             AsyncWebServerRequest *r = new (std::nothrow) AsyncWebServerRequest((AsyncWebServer *)s, c);
             if (r == NULL) {
                 c->close(true);
