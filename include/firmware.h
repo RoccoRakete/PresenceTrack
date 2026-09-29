@@ -43,4 +43,7 @@
 // which could leave a permanent stale "Restart required" indicator.
 // CONFIG_SCHEMA_VERSION bumped to 10 for the new ghost-filter fields (old
 // backups still load: they default to their built-in values).
-#define FIRMWARE_VERSION "0.4.5"
+// 0.4.6: Raised the HTTP server's ACK timeout to 15 s so that transfers of
+// the static web UI assets (app.js, index.html) survive packet loss on lossy
+// mobile Wi-Fi links instead of being cut off mid-transfer.
+#define FIRMWARE_VERSION "0.4.6"
