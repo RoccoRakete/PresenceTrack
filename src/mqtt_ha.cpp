@@ -227,6 +227,9 @@ static bool reconnect() {
     }
 
     if (ok) {
+        // Disable Nagle so small MQTT packets (publishes, PINGREQ) go out immediately.
+        // Must follow connect(): WiFiClient::connect() resets it to the global default.
+        s_wifiClient.setNoDelay(true);
         s_mqtt.publish(availabilityTopic(availBuf, sizeof(availBuf)), "online", true);
         s_discoveryPublished = false; // re-send discovery after (re)connect
         s_wasConnected = true;

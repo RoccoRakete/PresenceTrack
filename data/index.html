@@ -143,6 +143,7 @@
     <p class="muted">How often the firmware sends the MQTT server a sign of life. Lower = connection losses are detected sooner, higher = more tolerant of short Wi-Fi dropouts.</p>
     <label class="row"><span>MQTT connection timeout (s)</span><input type="number" id="mqtt-socket-timeout" min="1" max="30"></label>
     <p class="muted">How long the firmware waits for a reply from the server before it considers the connection lost. Must be lower than the keepalive.</p>
+    <p class="muted">Sporadic "MQTT Connection lost (state -3)" events usually mean the Wi-Fi link dropped the connection. Enable "Disable Wi-Fi power saving" under System → Network.</p>
   </div>
   <div class="card" id="ha-expose-card">
     <h2>Home Assistant Entities <span id="ha-expose-save-indicator" class="save-indicator"></span></h2>
@@ -160,7 +161,7 @@
     <div class="card" id="network-card">
       <h2>Network <span id="wifi-save-indicator" class="save-indicator"></span></h2>
       <label class="row"><span>Disable Wi-Fi power saving</span><input type="checkbox" id="wifi-no-sleep" class="switch"></label>
-      <p class="muted">Some Wi-Fi chips briefly power down to save energy, which delays replies and can cause "Connection lost" messages. Disabling power saving fixes this at the cost of a slightly higher power draw – negligible for a permanently powered device.</p>
+      <p class="muted">Some Wi-Fi chips briefly power down to save energy, which delays replies and can cause "Connection lost" messages (e.g. MQTT state -3). Disabling power saving fixes this at the cost of a slightly higher power draw – negligible for a permanently powered device.</p>
       <label class="row"><span>Hostname</span><input type="text" id="wifi-hostname" maxlength="31" pattern="[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?" placeholder="presencetrack"></label>
       <label class="row"><span>Static IP address</span><input type="checkbox" id="wifi-use-static-ip" class="switch"></label>
       <div id="wifi-static-fields" hidden>

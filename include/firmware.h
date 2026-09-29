@@ -46,4 +46,7 @@
 // 0.4.6: Raised the HTTP server's ACK timeout to 15 s so that transfers of
 // the static web UI assets (app.js, index.html) survive packet loss on lossy
 // mobile Wi-Fi links instead of being cut off mid-transfer.
-#define FIRMWARE_VERSION "0.4.6"
+// 0.4.7: Disable Nagle on the MQTT connection to reduce the chance of
+// spurious "Connection lost (state -3)" disconnects on lossy Wi-Fi links,
+// and point users at the "Disable Wi-Fi power saving" setting when they see it.
+#define FIRMWARE_VERSION "0.4.7"
